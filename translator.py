@@ -247,12 +247,17 @@ class GeminiTranslator:
                     contents=prompt,
                     config={
                         "system_instruction": SYSTEM_PROMPT,
-                        "response_format": {
-                            "text": {
-                                "mime_type": "application/json",
-                                "schema": schema,
-                            }
-                        },
+                        "response_mime_type": "application/json",
+                        "response_json_schema": schema,
+                        # Flash's "thinking" mode adds real latency for a task
+                        # this simple (a 2-minute round trip for two short
+                        # languages was the "spinning a lot" issue) — turning
+                        # it off is correct here, we don't need reasoning for
+                        # translation, just fast structured output.
+                        "thinking_config": {"thinking_budget": 0},
+                        # Generous cap so a full 30-language batch (the real
+                        # production run) can't get silently truncated mid-JSON.
+                        "max_output_tokens": 32768,
                     },
                 )
                 parsed = json.loads(response.text)
