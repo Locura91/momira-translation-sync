@@ -74,10 +74,20 @@ def build_updated_package_payload(
     """
     Builds the PUT body for ONE target language: a copy of the original EN
     entry (preserving every field we don't touch — pricing, ids, dates,
-    counters, largeTitle, themes, etc.) with title/description/ribbonText
-    swapped for their translated versions.
+    counters, largeTitle, etc.) with title/description/ribbonText swapped
+    for their translated versions.
+
+    `themes` is deliberately DROPPED from the payload entirely (not just
+    left untranslated) — confirmed against a real live PUT attempt that
+    Travel Compositor's write endpoint expects `themes` as an array of
+    `ThemeVO` objects, while GET returns it as plain strings (a real
+    schema mismatch between GET and PUT on Travel Compositor's side, not
+    something we can fix by reshaping the data ourselves without knowing
+    ThemeVO's actual required fields). Omitting the field lets Travel
+    Compositor keep whatever themes the package already has, untouched.
     """
     payload = dict(original_entry)
+    payload.pop("themes", None)
     for key in TEXT_FIELDS:
         if key in lang_fields:
             payload[key] = lang_fields[key]
