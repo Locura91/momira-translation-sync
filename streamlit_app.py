@@ -67,7 +67,7 @@ TEST_LANGUAGES = ["FR", "DE"]
 
 st.set_page_config(page_title="Momira Travel — Holiday Package Translator", page_icon="🌐")
 st.title("🌐 Momira Travel — Holiday Package Translator")
-st.caption("GET the active Holiday Package(s) → translate title/largeTitle/description/themes → PUT back, once per language.")
+st.caption("GET the active Holiday Package(s) → translate title/description/ribbonText → PUT back, once per language. (largeTitle and themes are intentionally left untouched.)")
 
 missing = [
     k for k in (required_api_key_env_var(), "TRAVELC_USERNAME", "TRAVELC_PASSWORD")
@@ -103,6 +103,15 @@ with st.sidebar:
     dry_run = st.checkbox(
         "Dry run (preview only — no writes to Travel Compositor)", value=True
     )
+    force = st.checkbox(
+        "Force re-translate (ignore the 'already done' tracker)",
+        value=False,
+        help=(
+            "Normally, a package/language already marked translated gets skipped. "
+            "Check this to re-translate anyway — useful right after fixing a bug, "
+            "or if you suspect a prior run wrote bad content."
+        ),
+    )
     limit = None
     if scope == "All active packages":
         limit_input = st.number_input(
@@ -115,6 +124,8 @@ if dry_run:
     st.info("🧪 Dry run mode — nothing will be written to Travel Compositor.")
 else:
     st.warning("⚠️ Live mode — this WILL write translated content to Travel Compositor.")
+if force:
+    st.warning("🔁 Force re-translate is ON — this ignores the 'already done' tracker for this run.")
 
 if st.button("🚀 Translate now", type="primary"):
     api = TravelCompositorAPI()
@@ -127,12 +138,14 @@ if st.button("🚀 Translate now", type="primary"):
                 st.error("Enter a Holiday Package ID first.")
                 st.stop()
             result = sync_holiday_package(
-                api, translator, store, microsite_id, package_id, target_languages, dry_run=dry_run
+                api, translator, store, microsite_id, package_id, target_languages,
+                dry_run=dry_run, force=force,
             )
             results = [result]
         else:
             results = sync_all_holiday_packages(
-                api, translator, store, microsite_id, target_languages, dry_run=dry_run, limit=limit
+                api, translator, store, microsite_id, target_languages,
+                dry_run=dry_run, limit=limit, force=force,
             )
 
     by_status = {}
