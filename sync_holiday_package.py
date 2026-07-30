@@ -260,10 +260,13 @@ def sync_one_package_entry(
         payload = build_updated_package_payload(entry, lang_fields)
 
         if dry_run:
+            preview = {k: payload.get(k) for k in TEXT_FIELDS if k in payload}
             print(f"--- DRY RUN preview: package {package_id}, lang {lang} ---")
-            preview = {k: payload.get(k) for k in TEXT_FIELDS}
             print(json.dumps(preview, indent=2, ensure_ascii=False))
-            per_lang_status[lang] = "dry_run_preview"
+            # Include the actual translated text in the returned result (not
+            # just a status string) so it's visible in the Streamlit app's
+            # "Full result" panel too, without needing server console access.
+            per_lang_status[lang] = {"status": "dry_run_preview", "preview": preview}
             continue
 
         result = api.update_holiday_package(microsite_id, package_id, payload, lang=lang)
