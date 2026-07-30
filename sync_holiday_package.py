@@ -1,31 +1,36 @@
 """
 sync_holiday_package.py — GET -> translate -> PUT loop for Holiday Packages.
 
-CONFIRMED SCOPE (from your 3 real GET examples):
+CONFIRMED SCOPE (from your real GET examples):
 
   1. GET /package/{micrositeId}                    <- marketing copy lives HERE
-     {"package": [{id, title, largeTitle, description, themes[...], ...}],
+     {"package": [{id, title, largeTitle, description, themes[...], ribbonText, ...}],
       "pagination": {...}}
-     This is the ONLY place `title` / `largeTitle` / `description` / `themes`
-     show up. It's also the source for the documented PUT
-     (IdeaUpdateRequestVO), so this is what we translate + write back.
+     This is the ONLY place the translatable fields show up. It's also the
+     source for the documented PUT (IdeaUpdateRequestVO), so this is what
+     we translate + write back.
 
   2. GET /package/{micrositeId}/info/{holidayPackageId}
      Day-to-day itinerary: destinations, hotels, tickets, transfers per day.
      The text here (hotel descriptions, ticket descriptions) is THIRD-PARTY
      supplier content (Expedia/GIATA hotel copy, Viator/GetYourGuide tour
      copy — see providerCode/ticketId/giataId fields). There is no
-     documented PUT for this shape, so it is OUT OF SCOPE: nothing to write
-     translations back to, and overwriting supplier-authored copy with our
-     own AI translation would likely be worse than what those suppliers
-     already provide natively for other locales.
+     documented PUT for this shape, so it is OUT OF SCOPE.
 
   3. GET /package/calendar/{micrositeId}/{holidayPackageId}
      Pricing calendar (currency + dates). No translatable text at all.
 
-So this module only ever touches #1: fetch the EN entry, translate
-title/largeTitle/description/themes, PUT back once per target language via
-PUT /package/{micrositeId}/{holidayPackageId}?lang={target}.
+TRANSLATABLE FIELDS (confirmed with you against real data): `title`,
+`description`, `ribbonText` ONLY.
+  - `largeTitle` is dropped from translation — real data shows it's always
+    an identical duplicate of `title`, so translating it separately would
+    just be wasted cost; it's left untouched (copied through as-is) in the
+    PUT payload.
+  - `themes` is dropped from translation — used for site filtering/category
+    matching, so it needs to stay in its original (English) form; also left
+    untouched (copied through as-is).
+  - `ribbonText` (e.g. "Holidays package") is ADDED — confirmed as a real
+    customer-facing label that does need translation.
 
 OPEN ITEM carried into the first live (non-dry-run) attempt: the documented
 PUT body (IdeaUpdateRequestVO) includes `visible`, `autocancelable`, and
@@ -33,44 +38,32 @@ PUT body (IdeaUpdateRequestVO) includes `visible`, `autocancelable`, and
 fabricate values for them — it PUTs back the original entry with only the
 translated fields swapped in. If Travel Compositor rejects that with a 400
 for a missing required field, the run_sync_packages.py output will show you
-the exact API error text; paste it back and we'll adjust the payload builder
-(most likely: it's fine to omit them and the API keeps existing values, or
-there's a documented default we're missing).
+the exact API error text; paste it back and we'll adjust the payload builder.
 """
 
 import json
 from typing import Dict, Any, List, Optional
 
 from state_store import StateStore, compute_hash
-from translator import ClaudeTranslator
 
 ENTITY_TYPE = "holiday_package"
 
-# Plain string fields we translate as-is.
-TEXT_FIELDS = ("title", "largeTitle", "description")
+# The only fields we translate. largeTitle and themes are deliberately
+# excluded (see module docstring) and are carried through untouched.
+TEXT_FIELDS = ("title", "description", "ribbonText")
 
 
 def extract_translatable_fields(package_entry: Dict[str, Any]) -> Dict[str, str]:
     """
     Pulls out everything translatable from ONE package entry (as returned
-    inside the "package" list by GET /package/{micrositeId}):
-      - title / largeTitle / description, only if present and non-empty
-      - themes (a flat list of strings), packed into indexed keys
-        "theme_0", "theme_1", ... so they ride through the same
-        field->string translation interface as everything else.
+    inside the "package" list by GET /package/{micrositeId}): title,
+    description, ribbonText — only if present and non-empty.
     """
     fields: Dict[str, str] = {}
     for key in TEXT_FIELDS:
         val = package_entry.get(key)
         if isinstance(val, str) and val.strip():
             fields[key] = val
-
-    themes = package_entry.get("themes")
-    if isinstance(themes, list):
-        for i, theme in enumerate(themes):
-            if isinstance(theme, str) and theme.strip():
-                fields[f"theme_{i}"] = theme
-
     return fields
 
 
@@ -80,31 +73,14 @@ def build_updated_package_payload(
 ) -> Dict[str, Any]:
     """
     Builds the PUT body for ONE target language: a copy of the original EN
-    entry (preserving every field we don't understand/touch — pricing,
-    ids, dates, counters, etc.) with title/largeTitle/description/themes
+    entry (preserving every field we don't touch — pricing, ids, dates,
+    counters, largeTitle, themes, etc.) with title/description/ribbonText
     swapped for their translated versions.
     """
     payload = dict(original_entry)
-
     for key in TEXT_FIELDS:
         if key in lang_fields:
             payload[key] = lang_fields[key]
-
-    theme_count = len(original_entry.get("themes") or [])
-    if theme_count and any(k.startswith("theme_") for k in lang_fields):
-        translated_themes = []
-        for i in range(theme_count):
-            theme_key = f"theme_{i}"
-            if theme_key in lang_fields:
-                translated_themes.append(lang_fields[theme_key])
-            else:
-                # Fallback: keep the original theme string if translation
-                # for this particular index is missing for some reason.
-                original_themes = original_entry.get("themes") or []
-                if i < len(original_themes):
-                    translated_themes.append(original_themes[i])
-        payload["themes"] = translated_themes
-
     return payload
 
 
@@ -175,12 +151,13 @@ def fetch_all_holiday_packages(
 
 def sync_one_package_entry(
     api,
-    translator: ClaudeTranslator,
+    translator,
     store: StateStore,
     microsite_id: str,
     entry: Dict[str, Any],
     target_languages: List[str],
     dry_run: bool = True,
+    force: bool = False,
 ) -> Dict[str, Any]:
     """Core sync logic given an already-fetched EN package entry (dict)."""
     package_id = entry.get("id")
@@ -198,14 +175,18 @@ def sync_one_package_entry(
         return {"status": "skipped", "package_id": package_id, "reason": "no translatable text fields found"}
 
     source_hash = compute_hash(translatable)
-    needed = store.languages_needed(ENTITY_TYPE, microsite_id, package_id, source_hash, target_languages)
+    if force:
+        # Ignore whatever the state store thinks is already done — useful
+        # right after fixing a translator bug, so you're not stuck waiting
+        # on a stale "already translated" record from a bad prior run.
+        needed = list(target_languages)
+    else:
+        needed = store.languages_needed(ENTITY_TYPE, microsite_id, package_id, source_hash, target_languages)
     if not needed:
         return {"status": "up_to_date", "package_id": package_id}
 
-    text_field_names = [k for k in translatable if not k.startswith("theme_")]
-    theme_count = len([k for k in translatable if k.startswith("theme_")])
     print(f"🌐 Translating package {package_id} ('{entry.get('title', '')}'): "
-          f"fields={text_field_names} + {theme_count} theme(s) -> {needed}")
+          f"fields={list(translatable.keys())} -> {needed}")
 
     translations = translator.translate_fields(translatable, needed)
 
@@ -217,7 +198,7 @@ def sync_one_package_entry(
 
         if dry_run:
             print(f"--- DRY RUN preview: package {package_id}, lang {lang} ---")
-            preview = {k: payload.get(k) for k in ("title", "largeTitle", "description", "themes")}
+            preview = {k: payload.get(k) for k in TEXT_FIELDS}
             print(json.dumps(preview, indent=2, ensure_ascii=False))
             per_lang_status[lang] = "dry_run_preview"
             continue
@@ -248,27 +229,29 @@ def sync_one_package_entry(
 
 def sync_holiday_package(
     api,
-    translator: ClaudeTranslator,
+    translator,
     store: StateStore,
     microsite_id: str,
     package_id: str,
     target_languages: List[str],
     dry_run: bool = True,
+    force: bool = False,
 ) -> Dict[str, Any]:
     entry = fetch_holiday_package_by_id(api, microsite_id, package_id)
     if entry is None:
         return {"status": "fetch_failed", "package_id": package_id}
-    return sync_one_package_entry(api, translator, store, microsite_id, entry, target_languages, dry_run=dry_run)
+    return sync_one_package_entry(api, translator, store, microsite_id, entry, target_languages, dry_run=dry_run, force=force)
 
 
 def sync_all_holiday_packages(
     api,
-    translator: ClaudeTranslator,
+    translator,
     store: StateStore,
     microsite_id: str,
     target_languages: List[str],
     dry_run: bool = True,
     limit: int = None,
+    force: bool = False,
 ) -> List[Dict[str, Any]]:
     packages = fetch_all_holiday_packages(api, microsite_id, limit=limit)
     print(f"📋 Found {len(packages)} holiday package(s) for microsite '{microsite_id}'.")
@@ -276,6 +259,6 @@ def sync_all_holiday_packages(
     results = []
     for entry in packages:
         results.append(
-            sync_one_package_entry(api, translator, store, microsite_id, entry, target_languages, dry_run=dry_run)
+            sync_one_package_entry(api, translator, store, microsite_id, entry, target_languages, dry_run=dry_run, force=force)
         )
     return results
