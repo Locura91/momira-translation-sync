@@ -1,16 +1,17 @@
 """
 sync_holiday_package.py — GET -> translate -> PUT loop for Holiday Packages.
 
-CONFIRMED SCOPE (from your real GET examples):
+CONFIRMED SCOPE (from your real GET examples + the official Swagger for
+both GET /package/{micrositeId} and PUT /package/{micrositeId}/{holidayPackageId}):
 
   1. GET /package/{micrositeId}                    <- marketing copy lives HERE
      {"package": [{id, title, largeTitle, description, themes[...], ribbonText, ...}],
       "pagination": {...}}
-     This is the ONLY place the translatable fields show up. It's also the
-     source for the documented PUT (IdeaUpdateRequestVO), so this is what
-     we translate + write back.
+     This is the ONLY place the translatable fields show up, and it's what we
+     translate + write back.
 
-  2. GET /package/{micrositeId}/info/{holidayPackageId}
+  2. GET /package/{micrositeId}/info/{holidayPackageId}  and
+     GET /package/{micrositeId}/{holidayPackageId} (getDayToDay)
      Day-to-day itinerary: destinations, hotels, tickets, transfers per day.
      The text here (hotel descriptions, ticket descriptions) is THIRD-PARTY
      supplier content (Expedia/GIATA hotel copy, Viator/GetYourGuide tour
@@ -20,25 +21,56 @@ CONFIRMED SCOPE (from your real GET examples):
   3. GET /package/calendar/{micrositeId}/{holidayPackageId}
      Pricing calendar (currency + dates). No translatable text at all.
 
+  4. PUT /package/{micrositeId}/{holidayPackageId}  (updateHolidayPackage)
+     CONFIRMED via the official Swagger request schema (IdeaUpdateRequestVO)
+     that the ONLY fields this endpoint accepts are:
+         active, title, largeTitle, description, remarks, themes,
+         visible, order, autocancelable
+     Two important consequences of this, confirmed directly from the schema
+     rather than guessed:
+       - There is NO ownership/permission-scope field anywhere in this
+         schema. That means the "401 User not allowed to modify a holiday
+         package" error we hit is confirmed to be an ACCOUNT-LEVEL
+         permission grant on Travel Compositor's side (something to fix via
+         their support/back office), not a payload bug — there is nothing
+         in the documented request body we could be getting wrong that
+         would cause this.
+       - `ribbonText` is NOT part of this write schema at all (it only
+         appears in the GET/response schema, IdeaVO). We still send a
+         translated ribbonText in the payload as a best-effort extra field
+         (harmless if Travel Compositor's deserializer ignores unknown
+         field names, which is what its behavior around other extra fields
+         suggests) — but until a real live PUT is confirmed to actually
+         change ribbonText on a following GET, treat this as UNCONFIRMED.
+         If it turns out Travel Compositor silently drops it, that's a
+         platform limitation, not something fixable in this code.
+
 TRANSLATABLE FIELDS (confirmed with you against real data): `title`,
 `description`, `ribbonText` ONLY.
   - `largeTitle` is dropped from translation — real data shows it's always
     an identical duplicate of `title`, so translating it separately would
-    just be wasted cost; it's left untouched (copied through as-is) in the
-    PUT payload.
-  - `themes` is dropped from translation — used for site filtering/category
-    matching, so it needs to stay in its original (English) form; also left
-    untouched (copied through as-is).
-  - `ribbonText` (e.g. "Holidays package") is ADDED — confirmed as a real
-    customer-facing label that does need translation.
+    just be wasted cost; it's still passed through untouched in the PUT
+    payload since it IS part of the documented write schema.
+  - `themes` is dropped from translation AND from the PUT payload entirely
+    — used for site filtering/category matching so it must stay in English,
+    and separately, GET returns it as plain strings while the PUT schema
+    requires an array of ThemeVO objects ({id, name, imageUrl}) — a real
+    confirmed schema mismatch (400 error) we can't safely fix without
+    knowing each theme's real numeric id, so we simply omit the field and
+    let Travel Compositor keep whatever themes the package already has.
+  - `ribbonText` (e.g. "Holidays package") IS translated — it's a real
+    customer-facing label — but see the PUT-schema caveat above: whether
+    Travel Compositor's write endpoint actually persists it is unconfirmed.
 
-OPEN ITEM carried into the first live (non-dry-run) attempt: the documented
-PUT body (IdeaUpdateRequestVO) includes `visible`, `autocancelable`, and
-`remarks` fields that never appear in real GET data. This code does NOT
-fabricate values for them — it PUTs back the original entry with only the
-translated fields swapped in. If Travel Compositor rejects that with a 400
-for a missing required field, the run_sync_packages.py output will show you
-the exact API error text; paste it back and we'll adjust the payload builder.
+PUT PAYLOAD SHAPE: built from ONLY the fields Travel Compositor's own
+Swagger documents as writable (`WRITABLE_FIELDS` below), taken from the
+original GET entry where present, with the translated title/description
+swapped in. We deliberately do NOT copy the entire original GET entry
+wholesale anymore — the GET response (IdeaVO) includes many fields (id,
+user, email, counters, customer, pricePerPerson, destinations, etc.) that
+are not part of the write schema at all, and sending them served no
+purpose while adding risk of tripping some other hidden validation (as
+happened with themes).
 """
 
 import json
@@ -49,8 +81,19 @@ from state_store import StateStore, compute_hash
 ENTITY_TYPE = "holiday_package"
 
 # The only fields we translate. largeTitle and themes are deliberately
-# excluded (see module docstring) and are carried through untouched.
+# excluded (see module docstring) and are carried through untouched
+# (largeTitle) or dropped (themes).
 TEXT_FIELDS = ("title", "description", "ribbonText")
+
+# Fields Travel Compositor's own Swagger documents as accepted by
+# PUT /package/{micrositeId}/{holidayPackageId} (schema: IdeaUpdateRequestVO).
+# Anything NOT in this list is left out of the payload on purpose (see
+# module docstring) — except ribbonText, which we still send as a
+# best-effort extra despite not being in this documented list (see below).
+WRITABLE_FIELDS = (
+    "active", "title", "largeTitle", "description", "remarks",
+    "visible", "order", "autocancelable",
+)
 
 
 def extract_translatable_fields(package_entry: Dict[str, Any]) -> Dict[str, str]:
@@ -72,25 +115,35 @@ def build_updated_package_payload(
     lang_fields: Dict[str, str],
 ) -> Dict[str, Any]:
     """
-    Builds the PUT body for ONE target language: a copy of the original EN
-    entry (preserving every field we don't touch — pricing, ids, dates,
-    counters, largeTitle, etc.) with title/description/ribbonText swapped
-    for their translated versions.
+    Builds the PUT body for ONE target language.
 
-    `themes` is deliberately DROPPED from the payload entirely (not just
-    left untranslated) — confirmed against a real live PUT attempt that
-    Travel Compositor's write endpoint expects `themes` as an array of
-    `ThemeVO` objects, while GET returns it as plain strings (a real
-    schema mismatch between GET and PUT on Travel Compositor's side, not
-    something we can fix by reshaping the data ourselves without knowing
-    ThemeVO's actual required fields). Omitting the field lets Travel
-    Compositor keep whatever themes the package already has, untouched.
+    Starts from ONLY the fields Travel Compositor's Swagger documents as
+    writable (WRITABLE_FIELDS), copied from the original EN entry when
+    present, then swaps in the translated title/description/ribbonText.
+
+    `themes` is deliberately DROPPED from the payload entirely — confirmed
+    against a real live PUT attempt that Travel Compositor's write endpoint
+    expects `themes` as an array of `ThemeVO` objects, while GET returns it
+    as plain strings (a real schema mismatch between GET and PUT on Travel
+    Compositor's side, not something we can fix by reshaping the data
+    ourselves without knowing each theme's real numeric id).
+
+    `ribbonText` is NOT in Travel Compositor's documented write schema at
+    all, but we include it anyway as a best-effort extra field — cheap to
+    try, and their deserializer appears to silently ignore field names it
+    doesn't recognize (based on the themes 400 error being a TYPE mismatch
+    on a recognized field, not a rejection of unrecognized ones). Confirm
+    with a real GET after a live PUT whether this actually takes effect.
     """
-    payload = dict(original_entry)
-    payload.pop("themes", None)
+    payload: Dict[str, Any] = {}
+    for key in WRITABLE_FIELDS:
+        if key in original_entry:
+            payload[key] = original_entry[key]
+
     for key in TEXT_FIELDS:
         if key in lang_fields:
             payload[key] = lang_fields[key]
+
     return payload
 
 
