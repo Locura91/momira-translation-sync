@@ -1,0 +1,55 @@
+name: Daily Holiday Package Translation Sync
+
+# This is "Mode B" — the autonomous daily check. It runs sync_all_holiday_packages
+# in live mode (no --dry-run) once a day, only touching active packages that are
+# new/changed/missing languages (the state store handles that filtering).
+#
+# BEFORE ENABLING: add these as encrypted repo secrets under
+# Settings -> Secrets and variables -> Actions -> New repository secret:
+#   TRAVELC_USERNAME, TRAVELC_PASSWORD, TRAVELC_MICROSITE_ID (optional,
+#   defaults to momiratravel), GEMINI_API_KEY (or ANTHROPIC_API_KEY if you
+#   set TRANSLATION_PROVIDER=claude below)
+#
+# GitHub Actions runners are ephemeral, so nbext_state.db (the "what's
+# already translated" tracker) is committed back to the repo at the end of
+# every run — otherwise tomorrow's run would forget today's work and
+# re-translate everything.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC daily — adjust to your preferred time
+  workflow_dispatch: {}    # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run holiday package sync (live)
+        env:
+          TRAVELC_BASE_URL: ${{ secrets.TRAVELC_BASE_URL }}
+          TRAVELC_MICROSITE_ID: ${{ secrets.TRAVELC_MICROSITE_ID }}
+          TRAVELC_USERNAME: ${{ secrets.TRAVELC_USERNAME }}
+          TRAVELC_PASSWORD: ${{ secrets.TRAVELC_PASSWORD }}
+          TRANSLATION_PROVIDER: gemini
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python run_sync_packages.py --all-languages
+
+      - name: Commit updated translation state
+        run: |
+          git config user.name "nbext-bot"
+          git config user.email "nbext-bot@users.noreply.github.com"
+          git add nbext_state.db
+          git diff --staged --quiet || git commit -m "Update translation state [skip ci]"
+          git push
