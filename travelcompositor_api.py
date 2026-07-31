@@ -1,9 +1,34 @@
 import os
+import json
 import difflib
 import requests
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 load_dotenv()
+
+
+def _try_parse_json(text: str):
+    """Best-effort JSON parse for including a response body in a log block."""
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def _mask_auth_token_header(headers: Dict[str, str]) -> Dict[str, str]:
+    """
+    Masks the auth-token value (e.g. 'abcd1234...wxyz') before it goes into
+    any log/result we might show in the app or paste into a support ticket.
+    Keeps enough of it visible (first 6 / last 4 chars) to prove a token was
+    present without exposing the live session token in full.
+    """
+    masked = {}
+    for k, v in dict(headers).items():
+        if k.lower() == "auth-token" and isinstance(v, str) and v:
+            masked[k] = f"{v[:6]}...{v[-4:]}" if len(v) > 12 else "***"
+        else:
+            masked[k] = v
+    return masked
 
 
 class TravelCompositorAPI:
@@ -579,12 +604,38 @@ class TravelCompositorAPI:
         return res.json()
 
     def update_holiday_package(self, microsite_id: str, holiday_package_id: str, payload: dict, lang: str = "EN") -> Dict[str, Any]:
-        """Executes PUT /package/{micrositeId}/{holidayPackageId}?lang= — writes ONE language's title/description/remarks."""
+        """
+        Executes PUT /package/{micrositeId}/{holidayPackageId}?lang= — writes
+        ONE language's title/description/remarks.
+
+        On failure, the returned dict includes a "request_response_log" block
+        with the full request (method, exact URL incl. query string, headers
+        with auth-token masked, JSON body) and full response (status code,
+        headers, body) — formatted so you can paste it directly into a
+        Travel Compositor support ticket when they ask for RQ/RS logs.
+        """
         url = f"{self.api_base_url}/package/{microsite_id}/{holiday_package_id}"
         res = self._request("PUT", url, params={"lang": lang}, json=payload)
         if res.status_code not in (200, 201):
             print(f"\n❌ API Error ({res.status_code}):\n{res.text}")
-            return {"error": res.status_code, "message": res.text}
+            req = res.request
+            return {
+                "error": res.status_code,
+                "message": res.text,
+                "request_response_log": {
+                    "request": {
+                        "method": req.method if req is not None else "PUT",
+                        "url": req.url if req is not None else f"{url}?lang={lang}",
+                        "headers": _mask_auth_token_header(req.headers if req is not None else self.get_headers()),
+                        "body": payload,
+                    },
+                    "response": {
+                        "status_code": res.status_code,
+                        "headers": dict(res.headers),
+                        "body": _try_parse_json(res.text),
+                    },
+                },
+            }
         return res.json()
 
     def get_holiday_packages(self, microsite_id: str, lang: str = "EN", **filters) -> Dict[str, Any]:
