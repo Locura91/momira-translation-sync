@@ -1,5 +1,5 @@
 """
-streamlit_app.py — with supplier dropdown and progress for "All tickets".
+streamlit_app.py — with supplier dropdown and detailed progress for options.
 """
 
 import os
@@ -40,7 +40,7 @@ from sync_holiday_package import sync_holiday_package, sync_all_holiday_packages
 from sync_ticket import (
     sync_ticket,
     sync_ticket_from_data,
-    sync_all_options_for_ticket,
+    sync_all_options_for_ticket_from_data,
     fetch_all_tickets,
 )
 
@@ -64,10 +64,8 @@ if missing:
     st.stop()
 
 
-# ----- Helper to fetch suppliers (cached) -----
-@st.cache_data(ttl=300)  # cache for 5 minutes
+@st.cache_data(ttl=300)
 def fetch_suppliers():
-    """Fetch supplier list from Travel Compositor and return a list of (id, name)."""
     try:
         api = TravelCompositorAPI()
         suppliers = api.get_all_suppliers()
@@ -96,7 +94,6 @@ with st.sidebar:
             limit = limit_input or None
 
     else:  # Tickets
-        # ---- Supplier selection ----
         suppliers = fetch_suppliers()
         if suppliers:
             supplier_options = {name: id for id, name in suppliers}
@@ -169,10 +166,10 @@ if st.button("🚀 Translate now", type="primary"):
                     api, translator, store, supplier_id, ticket_code, target_languages,
                     dry_run=dry_run, force=force
                 )
-                option_results = sync_all_options_for_ticket(
-                    api, translator, store, supplier_id, ticket_code, target_languages,
+                option_results = sync_all_options_for_ticket_from_data(
+                    api, translator, store, supplier_id, {"code": ticket_code}, target_languages,
                     dry_run=dry_run, force=force
-                )
+                ) if isinstance(main_result, dict) and main_result.get("status") != "fetch_failed" else []
                 if isinstance(main_result, dict):
                     main_result["options"] = option_results
                 results = [main_result] if isinstance(main_result, dict) else [main_result] + option_results
@@ -198,23 +195,34 @@ if st.button("🚀 Translate now", type="primary"):
                         api, translator, store, supplier_id, t, target_languages,
                         dry_run=dry_run, force=force
                     )
-                    # Show friendly message
                     if main_result.get("status") == "up_to_date":
                         st.write(f"   ✅ Skipped – already translated.")
                     else:
                         st.write(f"   → Syncing main ticket...")
                     results.append(main_result)
 
-                    # --- Options ---
-                    st.write(f"   → Syncing options for {code}...")
-                    option_results = sync_all_options_for_ticket(
-                        api, translator, store, supplier_id, code, target_languages,
+                    # --- Options (using pre-fetched ticket data) ---
+                    st.write(f"   → Syncing options...")
+                    option_results = sync_all_options_for_ticket_from_data(
+                        api, translator, store, supplier_id, t, target_languages,
                         dry_run=dry_run, force=force
                     )
                     if isinstance(main_result, dict):
                         main_result["options"] = option_results
                     else:
                         results.extend(option_results)
+
+                    # Show option summary
+                    if option_results:
+                        up_to_date = sum(1 for r in option_results if r.get('status') == 'up_to_date')
+                        updated = sum(1 for r in option_results if r.get('status') == 'updated')
+                        skipped = sum(1 for r in option_results if r.get('status') == 'skipped')
+                        st.write(f"      Options: {len(option_results)} total, {up_to_date} up-to-date, {updated} updated, {skipped} skipped")
+                        # Show each option status briefly
+                        for opt_res in option_results:
+                            opt_code = opt_res.get('option_code', '?')
+                            status = opt_res.get('status', 'unknown')
+                            st.write(f"         - {opt_code}: {status}")
 
                     st.write(f"   ✅ Finished ticket {code}")
                     st.divider()
