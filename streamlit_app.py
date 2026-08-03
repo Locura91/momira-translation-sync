@@ -1,5 +1,5 @@
 """
-streamlit_app.py — with supplier dropdown and detailed progress for options.
+streamlit_app.py — with supplier dropdown, progress, and live mode only.
 """
 
 import os
@@ -53,7 +53,7 @@ TEST_LANGUAGES = ["FR", "DE"]
 
 st.set_page_config(page_title="Momira Travel — Translator", page_icon="🌐")
 st.title("🌐 Momira Travel — Translation Sync")
-st.caption("Translate Holiday Packages or Tickets + their options.")
+st.caption("Translate Holiday Packages or Tickets + their options (live mode).")
 
 missing = [
     k for k in (required_api_key_env_var(), "TRAVELC_USERNAME", "TRAVELC_PASSWORD")
@@ -120,16 +120,12 @@ with st.sidebar:
     )
     target_languages = TEST_LANGUAGES if lang_mode.startswith("Test") else DEFAULT_TARGET_LANGUAGES
 
-    dry_run = st.checkbox("Dry run (preview only)", value=True)
     force = st.checkbox("Force re-translate (ignore tracker)", value=False)
 
 st.write(f"**Target languages:** {', '.join(target_languages)}")
-if dry_run:
-    st.info("🧪 Dry run mode — nothing will be written to Travel Compositor.")
-else:
-    st.warning("⚠️ Live mode — this WILL write translated content.")
+st.warning("⚠️ Live mode – translations will be written to Travel Compositor immediately.")
 if force:
-    st.warning("🔁 Force re-translate is ON — ignores the tracker.")
+    st.warning("🔁 Force re-translate is ON – ignores the tracker.")
 
 if st.button("🚀 Translate now", type="primary"):
     if entity_type == "Tickets" and not supplier_id:
@@ -148,13 +144,13 @@ if st.button("🚀 Translate now", type="primary"):
                     st.stop()
                 result = sync_holiday_package(
                     api, translator, store, microsite_id, package_id, target_languages,
-                    dry_run=dry_run, force=force
+                    dry_run=False, force=force
                 )
                 results = [result]
             else:
                 results = sync_all_holiday_packages(
                     api, translator, store, microsite_id, target_languages,
-                    dry_run=dry_run, limit=limit, force=force
+                    dry_run=False, limit=limit, force=force
                 )
 
         else:  # Tickets
@@ -164,11 +160,11 @@ if st.button("🚀 Translate now", type="primary"):
                     st.stop()
                 main_result = sync_ticket(
                     api, translator, store, supplier_id, ticket_code, target_languages,
-                    dry_run=dry_run, force=force
+                    dry_run=False, force=force
                 )
                 option_results = sync_all_options_for_ticket_from_data(
                     api, translator, store, supplier_id, {"code": ticket_code}, target_languages,
-                    dry_run=dry_run, force=force
+                    dry_run=False, force=force
                 ) if isinstance(main_result, dict) and main_result.get("status") != "fetch_failed" else []
                 if isinstance(main_result, dict):
                     main_result["options"] = option_results
@@ -193,7 +189,7 @@ if st.button("🚀 Translate now", type="primary"):
                     # --- Main ticket (using pre-fetched data) ---
                     main_result = sync_ticket_from_data(
                         api, translator, store, supplier_id, t, target_languages,
-                        dry_run=dry_run, force=force
+                        dry_run=False, force=force
                     )
                     if main_result.get("status") == "up_to_date":
                         st.write(f"   ✅ Skipped – already translated.")
@@ -201,11 +197,11 @@ if st.button("🚀 Translate now", type="primary"):
                         st.write(f"   → Syncing main ticket...")
                     results.append(main_result)
 
-                    # --- Options (using pre-fetched ticket data) ---
+                    # --- Options ---
                     st.write(f"   → Syncing options...")
                     option_results = sync_all_options_for_ticket_from_data(
                         api, translator, store, supplier_id, t, target_languages,
-                        dry_run=dry_run, force=force
+                        dry_run=False, force=force
                     )
                     if isinstance(main_result, dict):
                         main_result["options"] = option_results
@@ -218,7 +214,6 @@ if st.button("🚀 Translate now", type="primary"):
                         updated = sum(1 for r in option_results if r.get('status') == 'updated')
                         skipped = sum(1 for r in option_results if r.get('status') == 'skipped')
                         st.write(f"      Options: {len(option_results)} total, {up_to_date} up-to-date, {updated} updated, {skipped} skipped")
-                        # Show each option status briefly
                         for opt_res in option_results:
                             opt_code = opt_res.get('option_code', '?')
                             status = opt_res.get('status', 'unknown')
