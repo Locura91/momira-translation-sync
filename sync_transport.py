@@ -1,6 +1,6 @@
 """
 sync_transport.py — Sync transports (main + options) with translations.
-Uses concurrent option fetching (like tickets).
+Fixed: add missing airlineCode to prevent 400 error.
 """
 
 import json
@@ -18,10 +18,7 @@ DELAY_BETWEEN_BATCHES = 2
 MAX_OPTION_WORKERS = 5
 
 # ---- Main transport fields ----
-MAIN_TEXT_FIELDS = ("name", "description")  # pickupInformation not present in sample
-
-# ---- Option fields (will be detected dynamically) ----
-# Options may have 'datasheets' or 'translations' or 'remarks' with 'name'/'description'
+MAIN_TEXT_FIELDS = ("name", "description")
 
 
 def strip_html_and_compress(text: str) -> str:
@@ -42,7 +39,6 @@ def compress_translatable_fields(fields: Dict[str, str]) -> Dict[str, str]:
     return compressed
 
 
-# ---- Main transport extraction ----
 def extract_translatable_fields_from_transport(transport_entry: Dict[str, Any]) -> Dict[str, str]:
     datasheets = transport_entry.get("datasheets")
     if not datasheets:
@@ -68,16 +64,27 @@ def extract_translatable_fields_from_transport(transport_entry: Dict[str, Any]) 
     return fields
 
 
-def get_existing_content_for_language(entry: Dict[str, Any], lang: str, datasheets_key: str = "datasheets") -> Dict[str, str]:
-    datasheets = entry.get(datasheets_key, {})
-    lang_entry = datasheets.get(lang, {})
-    if not lang_entry:
-        return {}
+def get_existing_content_for_language(entry: Dict[str, Any], lang: str) -> Dict[str, str]:
+    # Try datasheets, then translations, then remarks
+    for key in ("datasheets", "translations", "remarks"):
+        container = entry.get(key)
+        if container and isinstance(container, dict):
+            lang_entry = container.get(lang)
+            if lang_entry and isinstance(lang_entry, dict):
+                fields = {}
+                for k, v in lang_entry.items():
+                    if isinstance(v, str) and v.strip():
+                        fields[k] = v
+                if fields:
+                    return fields
+            elif isinstance(lang_entry, str) and lang_entry.strip():
+                return {"remarks": lang_entry}
+    # Also check top-level fields like name, description
     fields = {}
-    # Try to extract any string fields (we don't know exact field names)
-    for k, v in lang_entry.items():
-        if isinstance(v, str) and v.strip():
-            fields[k] = v
+    for f in ("name", "description"):
+        val = entry.get(f)
+        if isinstance(val, str) and val.strip():
+            fields[f] = val
     return fields
 
 
@@ -146,7 +153,6 @@ def verify_and_filter_needed(
     return truly_needed
 
 
-# ---- Main transport sync ----
 def sync_transport_from_data(
     api,
     translator,
@@ -226,6 +232,8 @@ def sync_transport_from_data(
     write_start = time.time()
     payload = dict(transport_entry)
     payload["datasheets"] = new_datasheets
+    # --- FIX: add missing airlineCode ---
+    payload.setdefault("airlineCode", "")
     result = api.update_transport(supplier_id, payload)
     write_time = time.time() - write_start
     if isinstance(result, dict) and "error" in result:
@@ -254,31 +262,28 @@ def sync_transport(api, translator, store: StateStore,
                                     target_languages, dry_run=dry_run, force=force)
 
 
-# ---- Option extraction ----
+# ---- Option functions ----
 def extract_translatable_fields_from_transport_option(option_entry: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Extract fields from option. Options may have:
-    - datasheets (with EN)
-    - translations (with EN)
-    - remarks (with EN)
-    We'll try all and merge.
-    """
     fields = {}
-    # Try datasheets
-    datasheets = option_entry.get("datasheets")
-    if datasheets:
-        en_entry = datasheets.get("EN") or datasheets.get("EN_US") or {}
-        for k, v in en_entry.items():
-            if isinstance(v, str) and v.strip():
-                fields[k] = v
     # Try translations
     translations = option_entry.get("translations")
     if translations:
         en_entry = translations.get("EN") or translations.get("EN_US") or {}
-        for k, v in en_entry.items():
-            if isinstance(v, str) and v.strip() and k not in fields:
-                fields[k] = v
-    # Try remarks (sometimes a dict with language keys)
+        if isinstance(en_entry, dict):
+            for k, v in en_entry.items():
+                if isinstance(v, str) and v.strip():
+                    fields[k] = v
+        elif isinstance(en_entry, str) and en_entry.strip():
+            fields["name"] = en_entry
+    # Try datasheets
+    datasheets = option_entry.get("datasheets")
+    if datasheets:
+        en_entry = datasheets.get("EN") or datasheets.get("EN_US") or {}
+        if isinstance(en_entry, dict):
+            for k, v in en_entry.items():
+                if isinstance(v, str) and v.strip() and k not in fields:
+                    fields[k] = v
+    # Try remarks
     remarks = option_entry.get("remarks")
     if remarks and isinstance(remarks, dict):
         en_remarks = remarks.get("EN") or remarks.get("EN_US") or {}
@@ -288,7 +293,7 @@ def extract_translatable_fields_from_transport_option(option_entry: Dict[str, An
                     fields[k] = v
         elif isinstance(en_remarks, str) and en_remarks.strip():
             fields["remarks"] = en_remarks
-    # Also check top-level name/description (if present)
+    # Also top-level name/description
     for f in ("name", "description"):
         val = option_entry.get(f)
         if isinstance(val, str) and val.strip() and f not in fields:
@@ -297,46 +302,33 @@ def extract_translatable_fields_from_transport_option(option_entry: Dict[str, An
 
 
 def build_updated_option(original_option: Dict[str, Any],
-                         translations_by_lang: Dict[str, Dict[str, str]],
-                         datasheets_key: str = "datasheets") -> Dict[str, Any]:
-    """
-    Update option by merging translations into the appropriate field.
-    Prefers 'datasheets' if present, else 'translations', else 'remarks'.
-    """
+                         translations_by_lang: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
     new_option = dict(original_option)
 
-    # Determine where to put translations
+    # Determine where to put translations (prefer translations, then datasheets, then remarks)
     target_key = None
-    if "datasheets" in original_option and isinstance(original_option["datasheets"], dict):
-        target_key = "datasheets"
-    elif "translations" in original_option and isinstance(original_option["translations"], dict):
+    if "translations" in original_option and isinstance(original_option["translations"], dict):
         target_key = "translations"
+    elif "datasheets" in original_option and isinstance(original_option["datasheets"], dict):
+        target_key = "datasheets"
     elif "remarks" in original_option and isinstance(original_option["remarks"], dict):
         target_key = "remarks"
     else:
-        # No known field – create 'datasheets'
-        target_key = "datasheets"
+        target_key = "translations"
         new_option[target_key] = {}
 
     original_map = new_option.get(target_key, {})
     new_map = dict(original_map)
 
-    # For each language, merge translations
     for lang, trans in translations_by_lang.items():
-        # If target is a dict of strings (like remarks as a simple string per language)
-        # Handle both cases: map of objects or map of strings.
+        # For translations, we expect a dict per language
         if isinstance(original_map.get(lang), dict):
-            # We have a dict per language (e.g., {name, description})
             base = dict(original_map.get(lang, {}))
         else:
-            # It's a simple string or empty
             base = {}
-
-        # Update with translated fields
         for field, text in trans.items():
             base[field] = text
-
-        # If the target is expected to be a simple string and we only have one field, flatten
+        # If target_key is "remarks" and we only have one field "remarks", flatten
         if target_key == "remarks" and len(trans) == 1 and "remarks" in trans:
             new_map[lang] = trans["remarks"]
         else:
@@ -441,7 +433,6 @@ def sync_all_options_for_transport_from_data(
         return [{"status": "skipped", "transport_id": transport_entry.get("id"), "reason": "no options"}]
 
     transport_id = transport_entry.get("id")
-    # ---- Fetch options concurrently ----
     option_entries = {}
     with ThreadPoolExecutor(max_workers=MAX_OPTION_WORKERS) as executor:
         future_to_code = {
@@ -459,7 +450,6 @@ def sync_all_options_for_transport_from_data(
             except Exception as e:
                 option_entries[opt_code] = {"error": str(e)}
 
-    # ---- Process options sequentially ----
     results = []
     for opt_code in option_codes:
         option = option_entries.get(opt_code)
@@ -504,7 +494,6 @@ def sync_all_transports_for_supplier(
             api, translator, store, supplier_id, t, target_languages,
             dry_run=dry_run, force=force
         )
-        # Also sync options
         if result.get("status") not in ("fetch_failed", "skipped"):
             option_results = sync_all_options_for_transport_from_data(
                 api, translator, store, supplier_id, t, target_languages,
