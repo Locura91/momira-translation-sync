@@ -4,8 +4,6 @@ streamlit_app.py — with supplier dropdown, progress, and support for Transfers
 
 import os
 import json
-import sys
-from io import StringIO
 
 import streamlit as st
 
@@ -104,7 +102,6 @@ with st.sidebar:
             limit = limit_input or None
 
     elif entity_type == "Tickets":
-        # Supplier selection
         suppliers = fetch_suppliers()
         if suppliers:
             supplier_options = {name: id for id, name in suppliers}
@@ -126,7 +123,6 @@ with st.sidebar:
             limit = limit_input or None
 
     else:  # Transfers
-        # Supplier selection (same as tickets)
         suppliers = fetch_suppliers()
         if suppliers:
             supplier_options = {name: id for id, name in suppliers}
@@ -141,7 +137,7 @@ with st.sidebar:
         scope = st.radio("Which transfers?", ["All transfers", "One specific transfer ID"])
         transfer_id = None
         if scope == "One specific transfer ID":
-            transfer_id = st.text_input("Transfer ID (e.g., TR123)")
+            transfer_id = st.text_input("Transfer ID (e.g., TRANSFER-412566)")
         limit = None
         if scope == "All transfers":
             limit_input = st.number_input("Limit to first N transfers (0 = no limit)", min_value=0, value=5)
