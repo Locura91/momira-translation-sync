@@ -76,11 +76,11 @@ from sync_transfer import (
     fetch_all_transfers,
 )
 
-# Transport imports
 from sync_transport import (
     sync_transport,
     sync_transport_from_data,
     sync_all_transports_for_supplier,
+    sync_all_options_for_transport_from_data,   # <-- add this
     fetch_all_transports,
 )
 
