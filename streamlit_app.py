@@ -1,5 +1,5 @@
 """
-streamlit_app.py — with timing logs in the UI.
+streamlit_app.py — with supplier dropdown, progress, and support for Transfers.
 """
 
 import os
@@ -46,6 +46,14 @@ from sync_ticket import (
     fetch_all_tickets,
 )
 
+# Transfer imports
+from sync_transfer import (
+    sync_transfer,
+    sync_transfer_from_data,
+    sync_all_transfers_for_supplier,
+    fetch_all_transfers,
+)
+
 DEFAULT_TARGET_LANGUAGES = [
     "FR", "SL", "PL", "DE", "SK", "AR", "HR", "HU", "AZ", "NL", "ES", "TR",
     "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS", "TH", "EL", "FI", "JA",
@@ -55,7 +63,7 @@ TEST_LANGUAGES = ["FR", "DE"]
 
 st.set_page_config(page_title="Momira Travel — Translator", page_icon="🌐")
 st.title("🌐 Momira Travel — Translation Sync")
-st.caption("Translate Holiday Packages or Tickets + their options (live mode).")
+st.caption("Translate Holiday Packages, Tickets, or Transfers (live mode).")
 
 missing = [
     k for k in (required_api_key_env_var(), "TRAVELC_USERNAME", "TRAVELC_PASSWORD")
@@ -82,7 +90,7 @@ def fetch_suppliers():
 
 with st.sidebar:
     st.header("Settings")
-    entity_type = st.radio("What to translate?", ["Holiday Packages", "Tickets"])
+    entity_type = st.radio("What to translate?", ["Holiday Packages", "Tickets", "Transfers"])
 
     if entity_type == "Holiday Packages":
         microsite_id = st.text_input("Microsite ID", value=os.getenv("TRAVELC_MICROSITE_ID", "momiratravel"))
@@ -95,7 +103,8 @@ with st.sidebar:
             limit_input = st.number_input("Limit to first N packages (0 = no limit)", min_value=0, value=5)
             limit = limit_input or None
 
-    else:  # Tickets
+    elif entity_type == "Tickets":
+        # Supplier selection
         suppliers = fetch_suppliers()
         if suppliers:
             supplier_options = {name: id for id, name in suppliers}
@@ -116,6 +125,28 @@ with st.sidebar:
             limit_input = st.number_input("Limit to first N tickets (0 = no limit)", min_value=0, value=5)
             limit = limit_input or None
 
+    else:  # Transfers
+        # Supplier selection (same as tickets)
+        suppliers = fetch_suppliers()
+        if suppliers:
+            supplier_options = {name: id for id, name in suppliers}
+            selected_name = st.selectbox("Select Supplier", options=list(supplier_options.keys()))
+            supplier_id = str(supplier_options[selected_name])
+            st.caption(f"Using supplier ID: {supplier_id}")
+        else:
+            supplier_id = st.text_input("Supplier ID (numeric)", value=os.getenv("TRAVELC_SUPPLIER_ID", ""))
+            if not supplier_id:
+                st.warning("Please enter a supplier ID.")
+
+        scope = st.radio("Which transfers?", ["All transfers", "One specific transfer ID"])
+        transfer_id = None
+        if scope == "One specific transfer ID":
+            transfer_id = st.text_input("Transfer ID (e.g., TR123)")
+        limit = None
+        if scope == "All transfers":
+            limit_input = st.number_input("Limit to first N transfers (0 = no limit)", min_value=0, value=5)
+            limit = limit_input or None
+
     lang_mode = st.radio(
         "Languages",
         ["Test set (FR, DE)", "All 30 target languages"],
@@ -129,19 +160,17 @@ st.warning("⚠️ Live mode – translations will be written to Travel Composit
 if force:
     st.warning("🔁 Force re-translate is ON – ignores the tracker.")
 
-# We'll use a placeholder to show live logs
+# Log area placeholder
 log_placeholder = st.empty()
 
 def log_message(msg):
-    # Append to a persistent list
     if 'log_lines' not in st.session_state:
         st.session_state.log_lines = []
     st.session_state.log_lines.append(msg)
-    # Display the last 200 lines
     log_placeholder.text("\n".join(st.session_state.log_lines[-200:]))
 
 if st.button("🚀 Translate now", type="primary"):
-    if entity_type == "Tickets" and not supplier_id:
+    if entity_type != "Holiday Packages" and not supplier_id:
         st.error("Supplier ID is required.")
         st.stop()
 
@@ -170,7 +199,7 @@ if st.button("🚀 Translate now", type="primary"):
                     dry_run=False, limit=limit, force=force
                 )
 
-        else:  # Tickets
+        elif entity_type == "Tickets":
             if scope == "One specific ticket code":
                 if not ticket_code:
                     st.error("Enter a Ticket Code first.")
@@ -187,7 +216,7 @@ if st.button("🚀 Translate now", type="primary"):
                     main_result["options"] = option_results
                 results = [main_result] if isinstance(main_result, dict) else [main_result] + option_results
             else:
-                # ---- All tickets ----
+                # All tickets
                 log_message(f"📋 Fetching tickets for supplier {supplier_id}...")
                 tickets = fetch_all_tickets(api, supplier_id, limit=limit)
                 log_message(f"📋 Found {len(tickets)} ticket(s).")
@@ -204,7 +233,6 @@ if st.button("🚀 Translate now", type="primary"):
                     progress_placeholder.write(f"🔄 Processing ticket {idx+1}/{len(tickets)}: **{code}**")
                     log_message(f"🔄 Processing ticket {idx+1}/{len(tickets)}: {code}")
 
-                    # --- Main ticket (using pre-fetched data) ---
                     main_result = sync_ticket_from_data(
                         api, translator, store, supplier_id, t, target_languages,
                         dry_run=False, force=force
@@ -215,7 +243,6 @@ if st.button("🚀 Translate now", type="primary"):
                         log_message(f"   → Syncing main ticket...")
                     results.append(main_result)
 
-                    # --- Options ---
                     log_message(f"   → Syncing options...")
                     option_results = sync_all_options_for_ticket_from_data(
                         api, translator, store, supplier_id, t, target_languages,
@@ -226,7 +253,6 @@ if st.button("🚀 Translate now", type="primary"):
                     else:
                         results.extend(option_results)
 
-                    # Show option summary
                     if option_results:
                         up_to_date = sum(1 for r in option_results if r.get('status') == 'up_to_date')
                         updated = sum(1 for r in option_results if r.get('status') == 'updated')
@@ -238,7 +264,47 @@ if st.button("🚀 Translate now", type="primary"):
                             log_message(f"         - {opt_code}: {status}")
 
                     log_message(f"   ✅ Finished ticket {code}")
+                progress_placeholder.empty()
 
+        else:  # Transfers
+            if scope == "One specific transfer ID":
+                if not transfer_id:
+                    st.error("Enter a Transfer ID first.")
+                    st.stop()
+                result = sync_transfer(
+                    api, translator, store, supplier_id, transfer_id, target_languages,
+                    dry_run=False, force=force
+                )
+                results = [result]
+            else:
+                # All transfers
+                log_message(f"📋 Fetching transfers for supplier {supplier_id}...")
+                transfers = fetch_all_transfers(api, supplier_id, limit=limit)
+                log_message(f"📋 Found {len(transfers)} transfer(s).")
+                results = []
+                progress_placeholder = st.empty()
+
+                for idx, t in enumerate(transfers):
+                    transfer_id = t.get("id")
+                    if not transfer_id:
+                        log_message(f"⚠️ Skipping transfer {idx+1}: no 'id' field")
+                        results.append({"status": "skipped", "reason": "no id field", "raw": t})
+                        continue
+
+                    progress_placeholder.write(f"🔄 Processing transfer {idx+1}/{len(transfers)}: **{transfer_id}**")
+                    log_message(f"🔄 Processing transfer {idx+1}/{len(transfers)}: {transfer_id}")
+
+                    result = sync_transfer_from_data(
+                        api, translator, store, supplier_id, t, target_languages,
+                        dry_run=False, force=force
+                    )
+                    if result.get("status") == "up_to_date":
+                        log_message(f"   ✅ Skipped – already translated.")
+                    else:
+                        log_message(f"   → Syncing transfer...")
+                    results.append(result)
+
+                    log_message(f"   ✅ Finished transfer {transfer_id}")
                 progress_placeholder.empty()
 
     # Show summary
