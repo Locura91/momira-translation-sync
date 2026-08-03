@@ -76,11 +76,12 @@ from sync_transfer import (
     fetch_all_transfers,
 )
 
+# Transport imports
 from sync_transport import (
     sync_transport,
     sync_transport_from_data,
     sync_all_transports_for_supplier,
-    sync_all_options_for_transport_from_data,   # <-- add this
+    sync_all_options_for_transport_from_data,   # <-- ADDED
     fetch_all_transports,
 )
 
@@ -391,7 +392,7 @@ if st.button("🚀 Translate now", type="primary"):
                     results.append(result)
 
                     # Sync options
-                    if result.get("status") not in ("fetch_failed", "skipped"):
+                    if t.get("optionCodes"):
                         log_message(f"   → Syncing options for {transport_id}...")
                         option_results = sync_all_options_for_transport_from_data(
                             api, translator, store, supplier_id, t, target_languages,
@@ -411,6 +412,8 @@ if st.button("🚀 Translate now", type="primary"):
                                 opt_code = opt_res.get('option_code', '?')
                                 status = opt_res.get('status', 'unknown')
                                 log_message(f"         - {opt_code}: {status}")
+                    else:
+                        log_message(f"   → No options for {transport_id}")
 
                     log_message(f"   ✅ Finished transport {transport_id}")
                 progress_placeholder.empty()
