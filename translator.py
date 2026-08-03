@@ -119,7 +119,7 @@ class ClaudeTranslator:
         self,
         source_fields: Dict[str, str],
         target_languages: List[str],
-        retries: int = 2,
+        retries: int = 5,  # increased for rate-limit resilience
     ) -> Dict[str, Dict[str, str]]:
         """
         source_fields: {"title": "Airport Transfer to Hotel", "description": "..."}
@@ -146,15 +146,17 @@ class ClaudeTranslator:
         )
 
         last_error = None
+        raw_translations = {}
         for attempt in range(retries + 1):
             try:
                 response = self.client.messages.create(
                     model=self.model,
-                    max_tokens=8192,
+                    max_tokens=8192,  # Claude Haiku output limit
                     system=SYSTEM_PROMPT,
                     tools=[TRANSLATION_TOOL],
                     tool_choice={"type": "tool", "name": "submit_translations"},
                     messages=[{"role": "user", "content": prompt}],
+                    timeout=60,
                 )
                 tool_use = next((b for b in response.content if b.type == "tool_use"), None)
                 if not tool_use:
@@ -163,15 +165,27 @@ class ClaudeTranslator:
                 break
             except Exception as e:
                 last_error = e
-                print(f"⚠️  Translation call failed (attempt {attempt + 1}/{retries + 1}): {e}")
-                if attempt < retries:
-                    time.sleep(2 ** attempt)
+                # Check for rate-limit (HTTP 429)
+                is_rate_limit = False
+                if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                    is_rate_limit = e.response.status_code == 429
+                if not is_rate_limit and '429' in str(e):
+                    is_rate_limit = True
+
+                if is_rate_limit:
+                    wait = (2 ** attempt) * 5  # 5, 10, 20, 40, 80 seconds
+                    print(f"🚦 Claude rate limit hit (attempt {attempt+1}). Waiting {wait}s before retry...")
+                    time.sleep(wait)
                 else:
-                    print(f"❌ Giving up after {retries + 1} attempts — falling back to English for ALL languages.")
+                    print(f"⚠️  Translation call failed (attempt {attempt+1}/{retries+1}): {e}")
+                    if attempt < retries:
+                        time.sleep(2 ** attempt)
+
+                if attempt == retries:
+                    print(f"❌ Giving up after {retries+1} attempts — falling back to English for ALL languages.")
                     raw_translations = {}
 
         # Build the final result, filling any gaps with the English source
-        # (per-language AND per-field, so one bad language doesn't take down others).
         result = {}
         for lang in target_languages:
             lang_result = {}
@@ -226,7 +240,7 @@ class GeminiTranslator:
         self,
         source_fields: Dict[str, str],
         target_languages: List[str],
-        retries: int = 2,
+        retries: int = 5,  # increased for rate-limit resilience
     ) -> Dict[str, Dict[str, str]]:
         non_empty_fields = {k: v for k, v in source_fields.items() if isinstance(v, str) and v.strip()}
         if not non_empty_fields:
@@ -249,33 +263,39 @@ class GeminiTranslator:
                         "system_instruction": SYSTEM_PROMPT,
                         "response_mime_type": "application/json",
                         "response_json_schema": schema,
-                        # Flash's "thinking" mode adds real latency for a task
-                        # this simple (a 2-minute round trip for two short
-                        # languages was the "spinning a lot" issue) — turning
-                        # it off is correct here, we don't need reasoning for
-                        # translation, just fast structured output.
                         "thinking_config": {"thinking_budget": 0},
-                        # Generous cap so a full 30-language batch (the real
-                        # production run) can't get silently truncated mid-JSON.
-                        "max_output_tokens": 8192,
+                        "max_output_tokens": 8192,   # Gemini 2.5 Flash max output
+                        "timeout": 60,               # per‑request timeout
                     },
                 )
                 parsed = json.loads(response.text)
                 raw_translations = parsed.get("translations", {})
                 if not raw_translations:
                     raise TranslationError("Model returned no 'translations' key")
-                break
+                break  # success
             except Exception as e:
                 last_error = e
-                print(f"⚠️  Translation call failed (attempt {attempt + 1}/{retries + 1}): {e}")
-                if attempt < retries:
-                    time.sleep(2 ** attempt)
+                # Check for rate-limit (HTTP 429)
+                is_rate_limit = False
+                if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                    is_rate_limit = e.response.status_code == 429
+                if not is_rate_limit and '429' in str(e):
+                    is_rate_limit = True
+
+                if is_rate_limit:
+                    wait = (2 ** attempt) * 5  # 5, 10, 20, 40, 80 seconds
+                    print(f"🚦 Gemini rate limit hit (attempt {attempt+1}). Waiting {wait}s before retry...")
+                    time.sleep(wait)
                 else:
-                    print(f"❌ Giving up after {retries + 1} attempts — falling back to English for ALL languages.")
+                    print(f"⚠️  Translation call failed (attempt {attempt+1}/{retries+1}): {e}")
+                    if attempt < retries:
+                        time.sleep(2 ** attempt)
+
+                if attempt == retries:
+                    print(f"❌ Giving up after {retries+1} attempts — falling back to English for ALL languages.")
                     raw_translations = {}
 
-        # Same per-language, per-field fallback logic as ClaudeTranslator, so
-        # sync_engine.py / sync_holiday_package.py behave identically either way.
+        # Same per-language, per-field fallback logic as ClaudeTranslator
         result = {}
         for lang in target_languages:
             lang_result = {}
