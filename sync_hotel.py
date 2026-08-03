@@ -1,6 +1,6 @@
 """
-sync_hotel.py — Sync hotels (main + rooms + supplements + offers) with translations.
-Now includes room descriptions and offers.
+sync_hotel.py — Sync hotels (main + rooms + supplements + offers).
+Room name is NOT translated; only room description is translated.
 """
 
 import json
@@ -19,7 +19,7 @@ MAX_WORKERS = 5
 
 # ---- Translatable fields ----
 HOTEL_TEXT_FIELDS = ("hotelname", "description")
-ROOM_TEXT_FIELDS = ("name", "description")      # added description
+ROOM_TEXT_FIELDS = ("description",)   # only description, name excluded
 SUPPLEMENT_TEXT_FIELDS = ("description",)
 OFFER_TEXT_FIELDS = ("description",)
 
@@ -96,19 +96,15 @@ def build_updated_hotel_descriptions(
     return new_descriptions
 
 
-# ---------- Rooms (with description) ----------
+# ---------- Rooms (description only) ----------
 def extract_translatable_fields_from_room(room_entry: Dict[str, Any]) -> Dict[str, str]:
     fields = {}
-    # Top-level name
-    name = room_entry.get("name")
-    if isinstance(name, str) and name.strip():
-        fields["name"] = name
-    # Top-level description
+    # Only description is translatable; name is skipped.
     description = room_entry.get("description")
     if isinstance(description, str) and description.strip():
         fields["description"] = description
-    # Also check translations/datasheets for description if not present top-level
-    if "description" not in fields:
+    else:
+        # Check translations/datasheets for description if not top-level
         translations = room_entry.get("translations", {})
         en_trans = translations.get("EN") or translations.get("EN_US")
         if isinstance(en_trans, dict) and en_trans.get("description"):
@@ -123,26 +119,18 @@ def extract_translatable_fields_from_room(room_entry: Dict[str, Any]) -> Dict[st
 
 def get_existing_room_content_for_language(room_entry: Dict[str, Any], lang: str) -> Dict[str, str]:
     result = {}
-    # Check translations
     translations = room_entry.get("translations", {})
     lang_trans = translations.get(lang)
     if isinstance(lang_trans, dict):
-        if "name" in lang_trans and lang_trans["name"]:
-            result["name"] = lang_trans["name"]
         if "description" in lang_trans and lang_trans["description"]:
             result["description"] = lang_trans["description"]
-        if result:
-            return result
-    # Check datasheets
+        return result
     datasheets = room_entry.get("datasheets", {})
     lang_ds = datasheets.get(lang)
     if isinstance(lang_ds, dict):
-        if "name" in lang_ds and lang_ds["name"]:
-            result["name"] = lang_ds["name"]
         if "description" in lang_ds and lang_ds["description"]:
             result["description"] = lang_ds["description"]
-        return result
-    return {}
+    return result
 
 
 def build_updated_room(original_room: Dict[str, Any],
@@ -158,9 +146,9 @@ def build_updated_room(original_room: Dict[str, Any],
         new_room[target_key] = {}
     target_map = dict(new_room.get(target_key, {}))
     for lang, trans in translations_by_lang.items():
-        base = dict(target_map.get(lang, {}))
-        for field, text in trans.items():
-            base[field] = text
+        base = dict(target_map.get(lang, {}))   # preserve existing fields (e.g., name)
+        if "description" in trans:
+            base["description"] = trans["description"]
         target_map[lang] = base
     new_room[target_key] = target_map
     return new_room
