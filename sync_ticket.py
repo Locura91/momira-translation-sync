@@ -11,9 +11,9 @@ from state_store import StateStore, compute_hash
 from translator import get_translator
 
 # ---- Configuration ----
-BATCH_SIZE = 2          # Languages per translation API call (reduced from 5)
+BATCH_SIZE = 5          # Languages per translation API call (reduced from 5)
 MAX_ATTEMPTS = 5        # Max retry attempts per ticket/option
-DELAY_BETWEEN_BATCHES = 1.0   # seconds
+DELAY_BETWEEN_BATCHES = 15   # seconds
 DELAY_BETWEEN_ATTEMPTS = 5.0  # seconds
 
 # ---- Main ticket fields ----
@@ -186,12 +186,15 @@ def sync_ticket(api, translator, store: StateStore,
 
         combined = {}
         # Translate in batches
-        for i in range(0, len(needed), BATCH_SIZE):
-            batch = needed[i:i+BATCH_SIZE]
-            print(f"🌐 Translating ticket {ticket_code} (batch {i//BATCH_SIZE + 1}): {batch}")
-            batch_result = translator.translate_fields(translatable, batch)
-            combined.update(batch_result)
-            time.sleep(3)   # after each failed attempt
+for i in range(0, len(needed), BATCH_SIZE):
+    batch = needed[i:i+BATCH_SIZE]
+    print(f"🌐 Translating ... (batch {i//BATCH_SIZE + 1})")
+    batch_result = translator.translate_fields(translatable, batch)
+    combined_translations.update(batch_result)
+    # Wait between batches, but not after the last one
+    if i + BATCH_SIZE < len(needed):
+        print(f"⏳ Waiting {DELAY_BETWEEN_BATCHES}s to respect rate limits...")
+        time.sleep(DELAY_BETWEEN_BATCHES)
           
         # Filter only successful translations (changed from source)
         successful = filter_successful_translations(combined, translatable)
