@@ -1,20 +1,5 @@
 """
-streamlit_app.py — the "Translate now" button, as a small web app.
-
-This is a thin UI layer over code that's already built and tested
-(sync_holiday_package.py / travelcompositor_api.py / translator.py /
-state_store.py). It does not contain any new sync logic — it just gives a
-human a button to click instead of typing a CLI command.
-
-HOW CREDENTIALS WORK HERE (read this before deploying):
-This app reads Travel Compositor + Gemini/Anthropic credentials from
-Streamlit's built-in Secrets manager (st.secrets), NOT from a .env file,
-since a .env file never gets uploaded to GitHub/Streamlit Cloud (and
-shouldn't be).
-See README.md "Deploying the button (Streamlit)" for exactly where to
-paste your credentials — it's a private field in Streamlit Cloud's own
-dashboard, never committed to the repo, and never something you need to
-share with anyone else (including me) to get this running.
+streamlit_app.py — the "Translate now" button, now for Holiday Packages AND Tickets.
 """
 
 import os
@@ -24,12 +9,6 @@ import streamlit as st
 
 
 def _load_secrets_into_env():
-    """
-    Bridges Streamlit Cloud's Secrets manager into plain environment
-    variables, since TravelCompositorAPI / GeminiTranslator / ClaudeTranslator
-    already read their config via os.getenv(...) (so the exact same classes
-    work unchanged whether run from the CLI with a .env file, or from here).
-    """
     keys = [
         "TRAVELC_BASE_URL", "TRAVELC_MICROSITE_ID", "TRAVELC_USERNAME",
         "TRAVELC_PASSWORD", "TRANSLATION_PROVIDER",
@@ -42,22 +21,24 @@ def _load_secrets_into_env():
             if key in st.secrets:
                 os.environ[key] = str(st.secrets[key])
         except Exception:
-            # st.secrets raises if no secrets.toml exists at all (e.g. running
-            # locally without one) — that's fine, we just fall back to .env.
             pass
 
 
 _load_secrets_into_env()
 
 from dotenv import load_dotenv
-load_dotenv()  # local fallback if you're running this on your own machine
+load_dotenv()
 
 from travelcompositor_api import TravelCompositorAPI
 from translator import get_translator, required_api_key_env_var
 from state_store import StateStore
-from sync_holiday_package import sync_all_holiday_packages, sync_holiday_package
 
-# Same confirmed 30-language list as run_sync_packages.py.
+# Holiday package imports
+from sync_holiday_package import sync_holiday_package, sync_all_holiday_packages
+
+# Ticket imports
+from sync_ticket import sync_ticket, sync_all_options_for_ticket, fetch_all_tickets
+
 DEFAULT_TARGET_LANGUAGES = [
     "FR", "SL", "PL", "DE", "SK", "AR", "HR", "HU", "AZ", "NL", "ES", "TR",
     "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS", "TH", "EL", "FI", "JA",
@@ -65,96 +46,145 @@ DEFAULT_TARGET_LANGUAGES = [
 ]
 TEST_LANGUAGES = ["FR", "DE"]
 
-st.set_page_config(page_title="Momira Travel — Holiday Package Translator", page_icon="🌐")
-st.title("🌐 Momira Travel — Holiday Package Translator")
-st.caption("GET the active Holiday Package(s) → translate title/description/ribbonText → PUT back, once per language. (largeTitle and themes are intentionally left untouched.)")
+st.set_page_config(page_title="Momira Travel — Translator", page_icon="🌐")
+st.title("🌐 Momira Travel — Translation Sync")
+st.caption("Translate Holiday Packages or Tickets + their options.")
 
 missing = [
     k for k in (required_api_key_env_var(), "TRAVELC_USERNAME", "TRAVELC_PASSWORD")
     if not os.getenv(k)
 ]
 if missing:
-    st.error(
-        f"Missing required secret(s): {', '.join(missing)}. "
-        "Add them in Streamlit Cloud's Secrets manager (Settings → Secrets) "
-        "or in a local .env file, then reload this page."
-    )
+    st.error(f"Missing required secret(s): {', '.join(missing)}. Add them in Streamlit Cloud Secrets or local .env.")
     st.stop()
 
 with st.sidebar:
     st.header("Settings")
-    microsite_id = st.text_input(
-        "Microsite ID", value=os.getenv("TRAVELC_MICROSITE_ID", "momiratravel")
-    )
-    scope = st.radio(
-        "Which package(s)?",
-        ["All active packages", "One specific package ID"],
-    )
-    package_id = None
-    if scope == "One specific package ID":
-        package_id = st.text_input("Holiday Package ID")
+    entity_type = st.radio("What to translate?", ["Holiday Packages", "Tickets"])
+
+    if entity_type == "Holiday Packages":
+        microsite_id = st.text_input("Microsite ID", value=os.getenv("TRAVELC_MICROSITE_ID", "momiratravel"))
+        scope = st.radio("Which packages?", ["All active packages", "One specific package ID"])
+        package_id = None
+        if scope == "One specific package ID":
+            package_id = st.text_input("Holiday Package ID")
+        limit = None
+        if scope == "All active packages":
+            limit_input = st.number_input("Limit to first N packages (0 = no limit)", min_value=0, value=5)
+            limit = limit_input or None
+
+    else:  # Tickets
+        supplier_id = st.text_input("Supplier ID (numeric)", value=os.getenv("TRAVELC_SUPPLIER_ID", ""))
+        if not supplier_id:
+            st.warning("Please set TRAVELC_SUPPLIER_ID in secrets or enter it here.")
+        scope = st.radio("Which tickets?", ["All tickets", "One specific ticket code"])
+        ticket_code = None
+        if scope == "One specific ticket code":
+            ticket_code = st.text_input("Ticket Code (e.g., JAP-T1)")
+        limit = None
+        if scope == "All tickets":
+            limit_input = st.number_input("Limit to first N tickets (0 = no limit)", min_value=0, value=5)
+            limit = limit_input or None
 
     lang_mode = st.radio(
         "Languages",
-        ["Test set (FR, DE — cheap, good for a first try)", "All 30 target languages"],
+        ["Test set (FR, DE)", "All 30 target languages"],
     )
     target_languages = TEST_LANGUAGES if lang_mode.startswith("Test") else DEFAULT_TARGET_LANGUAGES
 
-    dry_run = st.checkbox(
-        "Dry run (preview only — no writes to Travel Compositor)", value=True
-    )
-    force = st.checkbox(
-        "Force re-translate (ignore the 'already done' tracker)",
-        value=False,
-        help=(
-            "Normally, a package/language already marked translated gets skipped. "
-            "Check this to re-translate anyway — useful right after fixing a bug, "
-            "or if you suspect a prior run wrote bad content."
-        ),
-    )
-    limit = None
-    if scope == "All active packages":
-        limit_input = st.number_input(
-            "Limit to first N packages (0 = no limit)", min_value=0, value=5
-        )
-        limit = limit_input or None
+    dry_run = st.checkbox("Dry run (preview only)", value=True)
+    force = st.checkbox("Force re-translate (ignore tracker)", value=False)
 
-st.write(f"**Target languages this run:** {', '.join(target_languages)}")
+st.write(f"**Target languages:** {', '.join(target_languages)}")
 if dry_run:
     st.info("🧪 Dry run mode — nothing will be written to Travel Compositor.")
 else:
-    st.warning("⚠️ Live mode — this WILL write translated content to Travel Compositor.")
+    st.warning("⚠️ Live mode — this WILL write translated content.")
 if force:
-    st.warning("🔁 Force re-translate is ON — this ignores the 'already done' tracker for this run.")
+    st.warning("🔁 Force re-translate is ON — ignores the tracker.")
 
 if st.button("🚀 Translate now", type="primary"):
     api = TravelCompositorAPI()
     translator = get_translator()
     store = StateStore()
 
-    with st.spinner("Working — this can take a little while for many packages/languages..."):
-        if scope == "One specific package ID":
-            if not package_id:
-                st.error("Enter a Holiday Package ID first.")
-                st.stop()
-            result = sync_holiday_package(
-                api, translator, store, microsite_id, package_id, target_languages,
-                dry_run=dry_run, force=force,
-            )
-            results = [result]
-        else:
-            results = sync_all_holiday_packages(
-                api, translator, store, microsite_id, target_languages,
-                dry_run=dry_run, limit=limit, force=force,
-            )
+    with st.spinner("Working..."):
+        if entity_type == "Holiday Packages":
+            if scope == "One specific package ID":
+                if not package_id:
+                    st.error("Enter a Holiday Package ID first.")
+                    st.stop()
+                result = sync_holiday_package(
+                    api, translator, store, microsite_id, package_id, target_languages,
+                    dry_run=dry_run, force=force
+                )
+                results = [result]
+            else:
+                results = sync_all_holiday_packages(
+                    api, translator, store, microsite_id, target_languages,
+                    dry_run=dry_run, limit=limit, force=force
+                )
 
+        else:  # Tickets
+            if not supplier_id:
+                st.error("Supplier ID is required.")
+                st.stop()
+            if scope == "One specific ticket code":
+                if not ticket_code:
+                    st.error("Enter a Ticket Code first.")
+                    st.stop()
+                # Sync main ticket
+                main_result = sync_ticket(
+                    api, translator, store, supplier_id, ticket_code, target_languages,
+                    dry_run=dry_run, force=force
+                )
+                # Sync options
+                option_results = sync_all_options_for_ticket(
+                    api, translator, store, supplier_id, ticket_code, target_languages,
+                    dry_run=dry_run, force=force
+                )
+                if isinstance(main_result, dict):
+                    main_result["options"] = option_results
+                results = [main_result] if isinstance(main_result, dict) else [main_result] + option_results
+            else:
+                # All tickets: we need to fetch tickets and process each
+                tickets = fetch_all_tickets(api, supplier_id, limit=limit)
+                results = []
+                for t in tickets:
+                    code = t.get("code")
+                    if not code:
+                        continue
+                    main_result = sync_ticket(
+                        api, translator, store, supplier_id, code, target_languages,
+                        dry_run=dry_run, force=force
+                    )
+                    results.append(main_result)
+                    if main_result.get("status") not in ("fetch_failed", "skipped"):
+                        option_results = sync_all_options_for_ticket(
+                            api, translator, store, supplier_id, code, target_languages,
+                            dry_run=dry_run, force=force
+                        )
+                        if isinstance(main_result, dict):
+                            main_result["options"] = option_results
+                        else:
+                            results.extend(option_results)
+
+    # Show summary
     by_status = {}
+    def count(r):
+        if isinstance(r, dict):
+            status = r.get("status", "unknown")
+            by_status.setdefault(status, []).append(r)
+            if "options" in r and isinstance(r["options"], list):
+                for opt in r["options"]:
+                    count(opt)
+        else:
+            by_status.setdefault("unknown", []).append(r)
     for r in results:
-        by_status.setdefault(r.get("status", "unknown"), []).append(r)
+        count(r)
 
     st.subheader("Summary")
     for status, items in by_status.items():
         st.write(f"**{status}**: {len(items)}")
-
     st.subheader("Full result")
     st.json(results)
