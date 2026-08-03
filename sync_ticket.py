@@ -1,5 +1,5 @@
 """
-sync_ticket.py — Optimized for speed: HTML stripping, larger batches, fewer languages.
+sync_ticket.py — Optimized with sync_ticket_from_data to avoid extra GET.
 """
 
 import json
@@ -11,13 +11,8 @@ from state_store import StateStore, compute_hash
 from translator import get_translator
 
 # ---- Configuration ----
-BATCH_SIZE = 10              # More languages per call (faster)
-DELAY_BETWEEN_BATCHES = 5    # Reduced delay (Claude paid tier)
-DEFAULT_LANGUAGES = [
-    "FR", "SL", "PL", "DE", "SK", "AR", "HR", "HU", "AZ", "NL",
-    "ES", "TR", "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS",
-    "TH", "EL", "FI", "JA", "SR", "PT", "DA", "IT", "MS", "SQ"
-]
+BATCH_SIZE = 10
+DELAY_BETWEEN_BATCHES = 2   # Reduced further (Claude paid tier)
 
 # ---- Main ticket fields ----
 TEXT_FIELDS = ("name", "description", "meetingPoint", "activityType",
@@ -26,22 +21,14 @@ LIST_FIELDS = ("includes", "excludes")
 
 
 def strip_html_and_compress(text: str) -> str:
-    """
-    Remove HTML tags, extra whitespace, and newlines to reduce token usage.
-    """
     if not text:
         return text
-    # Remove HTML tags
     text = re.sub(r'<[^>]+>', ' ', text)
-    # Replace multiple spaces/newlines with single space
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 
 def compress_translatable_fields(fields: Dict[str, str]) -> Dict[str, str]:
-    """
-    Compress all text fields by stripping HTML and extra whitespace.
-    """
     compressed = {}
     for key, value in fields.items():
         if isinstance(value, str):
@@ -152,7 +139,6 @@ def verify_and_filter_needed(
         if is_identical:
             truly_needed.append(lang)
         else:
-            print(f"✅ {lang} already translated (content differs). Updating state.")
             languages_to_add_to_state.append(lang)
 
     if languages_to_add_to_state:
@@ -164,19 +150,26 @@ def verify_and_filter_needed(
     return truly_needed
 
 
-def sync_ticket(api, translator, store: StateStore,
-                supplier_id: str, ticket_code: str,
-                target_languages: List[str],
-                dry_run: bool = True, force: bool = False) -> Dict[str, Any]:
-    ticket = api.get_ticket(supplier_id, ticket_code)
-    if isinstance(ticket, dict) and "error" in ticket:
-        return {"status": "fetch_failed", "ticket_code": ticket_code, "detail": ticket}
+# ----- New function: sync from already fetched ticket data -----
+def sync_ticket_from_data(
+    api,
+    translator,
+    store: StateStore,
+    supplier_id: str,
+    ticket_entry: Dict[str, Any],
+    target_languages: List[str],
+    dry_run: bool = True,
+    force: bool = False,
+) -> Dict[str, Any]:
+    ticket_code = ticket_entry.get("code")
+    if not ticket_code:
+        return {"status": "skipped", "reason": "no code field"}
 
-    datasheets = ticket.get("datasheets")
+    datasheets = ticket_entry.get("datasheets")
     if not datasheets:
         return {"status": "skipped", "ticket_code": ticket_code, "reason": "no datasheets"}
 
-    translatable = extract_translatable_fields_from_ticket(ticket)
+    translatable = extract_translatable_fields_from_ticket(ticket_entry)
     if not translatable:
         return {"status": "skipped", "ticket_code": ticket_code, "reason": "no translatable fields"}
 
@@ -186,13 +179,13 @@ def sync_ticket(api, translator, store: StateStore,
     else:
         needed = verify_and_filter_needed(
             store, "ticket", supplier_id, ticket_code, source_hash,
-            target_languages, ticket, translatable
+            target_languages, ticket_entry, translatable
         )
 
     if not needed:
         return {"status": "up_to_date", "ticket_code": ticket_code}
 
-    # Compress source text to reduce tokens
+    # Compress source text
     compressed_translatable = compress_translatable_fields(translatable)
 
     print(f"🌐 Translating ticket {ticket_code}: {len(needed)} languages")
@@ -229,7 +222,7 @@ def sync_ticket(api, translator, store: StateStore,
         return {"status": "dry_run_preview", "ticket_code": ticket_code,
                 "languages": list(successful.keys()), "preview": preview}
 
-    payload = dict(ticket)
+    payload = dict(ticket_entry)
     payload["datasheets"] = new_datasheets
     result = api.update_ticket(supplier_id, payload)
     if isinstance(result, dict) and "error" in result:
@@ -244,7 +237,19 @@ def sync_ticket(api, translator, store: StateStore,
     return {"status": "updated", "ticket_code": ticket_code, "languages_written": written_langs}
 
 
-# ---- Option functions (with same optimizations) ----
+# Keep original sync_ticket as wrapper (for single ticket mode)
+def sync_ticket(api, translator, store: StateStore,
+                supplier_id: str, ticket_code: str,
+                target_languages: List[str],
+                dry_run: bool = True, force: bool = False) -> Dict[str, Any]:
+    ticket = api.get_ticket(supplier_id, ticket_code)
+    if isinstance(ticket, dict) and "error" in ticket:
+        return {"status": "fetch_failed", "ticket_code": ticket_code, "detail": ticket}
+    return sync_ticket_from_data(api, translator, store, supplier_id, ticket,
+                                 target_languages, dry_run=dry_run, force=force)
+
+
+# ---- Option functions (unchanged) ----
 def get_existing_option_content(option_entry: Dict[str, Any], lang: str) -> Dict[str, str]:
     fields = {}
     remarks = option_entry.get("remarks", {})
@@ -341,7 +346,6 @@ def sync_ticket_option(api, translator, store: StateStore,
     if not needed:
         return {"status": "up_to_date", "option_code": option_code}
 
-    # Compress source text to reduce tokens
     compressed_translatable = compress_translatable_fields(translatable)
 
     print(f"🌐 Translating option {option_code}: {len(needed)} languages")
