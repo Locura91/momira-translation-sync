@@ -12,7 +12,7 @@ from translator import get_translator
 
 # ---- Configuration ----
 BATCH_SIZE = 10
-DELAY_BETWEEN_BATCHES = 2   # Reduced further (Claude paid tier)
+DELAY_BETWEEN_BATCHES = 2   # Reduced (Claude paid tier)
 
 # ---- Main ticket fields ----
 TEXT_FIELDS = ("name", "description", "meetingPoint", "activityType",
