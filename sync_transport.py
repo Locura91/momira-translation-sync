@@ -1,6 +1,6 @@
 """
 sync_transport.py — Sync transports (main + options) with translations.
-Now syncs options even when using a single transport ID.
+Fixed: baggageAllowance default to 1 if missing or not a number.
 """
 
 import json
@@ -250,7 +250,6 @@ def sync_transport_from_data(
     return {"status": "updated", "transport_id": transport_id, "languages_written": written_langs}
 
 
-# ----- Single transport sync (now with options) -----
 def sync_transport(api, translator, store: StateStore,
                    supplier_id: str, transport_id: str,
                    target_languages: List[str],
@@ -259,11 +258,9 @@ def sync_transport(api, translator, store: StateStore,
     if isinstance(transport, dict) and "error" in transport:
         return {"status": "fetch_failed", "transport_id": transport_id, "detail": transport}
 
-    # Sync main
     main_result = sync_transport_from_data(api, translator, store, supplier_id, transport,
                                            target_languages, dry_run=dry_run, force=force)
 
-    # Sync options if they exist
     if transport.get("optionCodes"):
         option_results = sync_all_options_for_transport_from_data(
             api, translator, store, supplier_id, transport, target_languages,
@@ -412,6 +409,10 @@ def sync_transport_option_from_data(
 
     updated_option = build_updated_option(option_entry, successful)
 
+    # Ensure baggageAllowance is a number (set to 1 if missing or not a number)
+    if "baggageAllowance" not in updated_option or not isinstance(updated_option.get("baggageAllowance"), (int, float)):
+        updated_option["baggageAllowance"] = 1
+
     if dry_run:
         preview = {lang: {k: v for k, v in trans.items()} for lang, trans in successful.items()}
         return {"status": "dry_run_preview", "option_code": option_code,
@@ -509,14 +510,12 @@ def sync_all_transports_for_supplier(
             results.append({"status": "skipped", "reason": "no id field", "raw": t})
             continue
 
-        # Sync main transport
         main_result = sync_transport_from_data(
             api, translator, store, supplier_id, t, target_languages,
             dry_run=dry_run, force=force
         )
         results.append(main_result)
 
-        # Always sync options if they exist
         if t.get("optionCodes"):
             option_results = sync_all_options_for_transport_from_data(
                 api, translator, store, supplier_id, t, target_languages,
