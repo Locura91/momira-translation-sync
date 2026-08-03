@@ -1,5 +1,6 @@
 """
 streamlit_app.py — the "Translate now" button, now for Holiday Packages AND Tickets.
+With visual progress for "All tickets" runs.
 """
 
 import os
@@ -37,14 +38,18 @@ from state_store import StateStore
 from sync_holiday_package import sync_holiday_package, sync_all_holiday_packages
 
 # Ticket imports
-from sync_ticket import sync_ticket, sync_all_options_for_ticket, fetch_all_tickets
+from sync_ticket import (
+    sync_ticket,
+    sync_all_options_for_ticket,
+    fetch_all_tickets,
+)
 
 DEFAULT_TARGET_LANGUAGES = [
     "FR", "SL", "PL", "DE", "SK", "AR", "HR", "HU", "AZ", "NL", "ES", "TR",
     "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS", "TH", "EL", "FI", "JA",
     "SR", "PT", "DA", "IT", "MS", "SQ",
 ]
-TEST_LANGUAGES = ["PL"]
+TEST_LANGUAGES = ["FR", "DE"]
 
 st.set_page_config(page_title="Momira Travel — Translator", page_icon="🌐")
 st.title("🌐 Momira Travel — Translation Sync")
@@ -133,12 +138,10 @@ if st.button("🚀 Translate now", type="primary"):
                 if not ticket_code:
                     st.error("Enter a Ticket Code first.")
                     st.stop()
-                # Sync main ticket
                 main_result = sync_ticket(
                     api, translator, store, supplier_id, ticket_code, target_languages,
                     dry_run=dry_run, force=force
                 )
-                # Sync options
                 option_results = sync_all_options_for_ticket(
                     api, translator, store, supplier_id, ticket_code, target_languages,
                     dry_run=dry_run, force=force
@@ -147,27 +150,45 @@ if st.button("🚀 Translate now", type="primary"):
                     main_result["options"] = option_results
                 results = [main_result] if isinstance(main_result, dict) else [main_result] + option_results
             else:
-                # All tickets: we need to fetch tickets and process each
+                # All tickets – with progress display
+                st.info(f"📋 Fetching tickets for supplier {supplier_id}...")
                 tickets = fetch_all_tickets(api, supplier_id, limit=limit)
+                st.info(f"📋 Found {len(tickets)} ticket(s).")
                 results = []
-                for t in tickets:
+                progress_placeholder = st.empty()
+
+                for idx, t in enumerate(tickets):
                     code = t.get("code")
                     if not code:
+                        st.warning(f"⚠️ Skipping ticket {idx+1}: no code field")
+                        results.append({"status": "skipped", "reason": "no code field", "raw": t})
                         continue
+
+                    progress_placeholder.write(f"🔄 Processing ticket {idx+1}/{len(tickets)}: **{code}**")
+
+                    # Main ticket
+                    st.write(f"   → Syncing main ticket...")
                     main_result = sync_ticket(
                         api, translator, store, supplier_id, code, target_languages,
                         dry_run=dry_run, force=force
                     )
                     results.append(main_result)
-                    if main_result.get("status") not in ("fetch_failed", "skipped"):
-                        option_results = sync_all_options_for_ticket(
-                            api, translator, store, supplier_id, code, target_languages,
-                            dry_run=dry_run, force=force
-                        )
-                        if isinstance(main_result, dict):
-                            main_result["options"] = option_results
-                        else:
-                            results.extend(option_results)
+
+                    # Options
+                    st.write(f"   → Syncing options for {code}...")
+                    option_results = sync_all_options_for_ticket(
+                        api, translator, store, supplier_id, code, target_languages,
+                        dry_run=dry_run, force=force
+                    )
+                    if isinstance(main_result, dict):
+                        main_result["options"] = option_results
+                    else:
+                        results.extend(option_results)
+
+                    st.write(f"   ✅ Finished ticket {code}")
+                    st.divider()
+
+                progress_placeholder.empty()
 
     # Show summary
     by_status = {}
