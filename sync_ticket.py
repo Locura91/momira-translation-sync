@@ -1,10 +1,6 @@
 """
 sync_ticket.py — Sync tickets (main + options) with translation.
-
-Main ticket: datasheets map with name, description, meetingPoint, activityType,
-             voucherRemarks, departureTime, includes, excludes.
-Ticket option: remarks (map of language -> {name, remarks}) and
-               supplements (list with translations map).
+Now filters out languages where the translation is identical to the source.
 """
 
 import json
@@ -17,6 +13,29 @@ from translator import get_translator
 TEXT_FIELDS = ("name", "description", "meetingPoint", "activityType",
                "voucherRemarks", "departureTime")
 LIST_FIELDS = ("includes", "excludes")
+
+
+def filter_successful_translations(
+    translations: Dict[str, Dict[str, str]],
+    source_fields: Dict[str, str]
+) -> Dict[str, Dict[str, str]]:
+    """
+    Return only languages where at least one field's translation differs from
+    the source. Logs warnings for skipped languages.
+    """
+    successful = {}
+    for lang, trans in translations.items():
+        # Check if any field has changed
+        changed = False
+        for field, src in source_fields.items():
+            if trans.get(field) != src:
+                changed = True
+                break
+        if changed:
+            successful[lang] = trans
+        else:
+            print(f"⚠️  Translation for {lang} is identical to source; skipping.")
+    return successful
 
 
 def extract_translatable_fields_from_ticket(ticket_entry: Dict[str, Any]) -> Dict[str, str]:
@@ -98,7 +117,13 @@ def sync_ticket(api, translator, store: StateStore,
         return {"status": "up_to_date", "ticket_code": ticket_code}
 
     print(f"🌐 Translating ticket {ticket_code}: fields={list(translatable.keys())} -> {needed}")
-    translations = translator.translate_fields(translatable, needed)
+    all_translations = translator.translate_fields(translatable, needed)
+
+    # Filter out languages that didn't actually change
+    translations = filter_successful_translations(all_translations, translatable)
+    if not translations:
+        return {"status": "skipped", "ticket_code": ticket_code,
+                "reason": "no successful translations (all identical to source)"}
 
     en_entry = datasheets.get("EN") or datasheets.get("EN_US") or {}
     new_datasheets = build_updated_datasheets(datasheets, translations, en_entry)
@@ -107,7 +132,7 @@ def sync_ticket(api, translator, store: StateStore,
         preview = {lang: {k: v for k, v in trans.items() if k in TEXT_FIELDS or k in LIST_FIELDS}
                    for lang, trans in translations.items()}
         return {"status": "dry_run_preview", "ticket_code": ticket_code,
-                "languages": needed, "preview": preview}
+                "languages": list(translations.keys()), "preview": preview}
 
     payload = dict(ticket)
     payload["datasheets"] = new_datasheets
@@ -115,12 +140,15 @@ def sync_ticket(api, translator, store: StateStore,
     if isinstance(result, dict) and "error" in result:
         return {"status": "put_failed", "ticket_code": ticket_code, "detail": result}
 
+    # Update state only for languages that were actually written
+    written_langs = list(translations.keys())
     prior_state = store.get_state("ticket", supplier_id, ticket_code)
     prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
-    all_langs = sorted(set(prior_langs) | set(needed))
+    all_langs = sorted(set(prior_langs) | set(written_langs))
     store.upsert_state("ticket", supplier_id, ticket_code, source_hash, all_langs)
 
-    return {"status": "updated", "ticket_code": ticket_code, "languages_written": needed}
+    return {"status": "updated", "ticket_code": ticket_code,
+            "languages_written": written_langs}
 
 
 # ---- Ticket option (modality) ----
@@ -206,25 +234,35 @@ def sync_ticket_option(api, translator, store: StateStore,
         return {"status": "up_to_date", "option_code": option_code}
 
     print(f"🌐 Translating option {option_code} of {ticket_code}: fields={list(translatable.keys())} -> {needed}")
-    translations = translator.translate_fields(translatable, needed)
+    all_translations = translator.translate_fields(translatable, needed)
+
+    # Filter out languages that didn't actually change
+    translations = filter_successful_translations(all_translations, translatable)
+    if not translations:
+        return {"status": "skipped", "option_code": option_code,
+                "reason": "no successful translations (all identical to source)"}
+
     updated_option = build_updated_option(option, translations)
 
     if dry_run:
         preview = {lang: {k: v for k, v in trans.items() if k.startswith(("remarks_", "supplement_"))}
                    for lang, trans in translations.items()}
         return {"status": "dry_run_preview", "option_code": option_code,
-                "languages": needed, "preview": preview}
+                "languages": list(translations.keys()), "preview": preview}
 
     result = api.update_ticket_option(supplier_id, ticket_code, updated_option)
     if isinstance(result, dict) and "error" in result:
         return {"status": "put_failed", "option_code": option_code, "detail": result}
 
+    # Update state only for languages that were actually written
+    written_langs = list(translations.keys())
     prior_state = store.get_state("ticket_option", supplier_id, entity_id, option_code=option_code)
     prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
-    all_langs = sorted(set(prior_langs) | set(needed))
+    all_langs = sorted(set(prior_langs) | set(written_langs))
     store.upsert_state("ticket_option", supplier_id, entity_id, source_hash, all_langs, option_code=option_code)
 
-    return {"status": "updated", "option_code": option_code, "languages_written": needed}
+    return {"status": "updated", "option_code": option_code,
+            "languages_written": written_langs}
 
 
 def sync_all_options_for_ticket(api, translator, store: StateStore,
