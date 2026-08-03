@@ -1,5 +1,5 @@
 """
-streamlit_app.py — with supplier dropdown, progress, support for Transfers, and password protection.
+streamlit_app.py — with supplier dropdown, progress, support for Transfers and Transports.
 """
 
 import os
@@ -8,25 +8,18 @@ import hmac
 import streamlit as st
 
 
-# ----------------------------------------------------------------------------
-# Password check (must run before any code that uses st.secrets or st.stop)
-# ----------------------------------------------------------------------------
 def check_password():
     """Returns `True` if the user had the correct password."""
-
     def password_entered():
-        """Checks whether a password entered by the user is correct."""
         if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don't store the password.
+            del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
 
-    # Return True if the password is validated.
     if st.session_state.get("password_correct", False):
         return True
 
-    # Show input for password.
     st.text_input(
         "Password", type="password", on_change=password_entered, key="password"
     )
@@ -35,14 +28,10 @@ def check_password():
     return False
 
 
-# --- Password gate ---
 if not check_password():
-    st.stop()  # Do not continue if check_password is False.
+    st.stop()
 
 
-# ----------------------------------------------------------------------------
-# Load secrets into environment (for downstream modules)
-# ----------------------------------------------------------------------------
 def _load_secrets_into_env():
     keys = [
         "TRAVELC_BASE_URL", "TRAVELC_MICROSITE_ID", "TRAVELC_USERNAME",
@@ -64,9 +53,6 @@ _load_secrets_into_env()
 from dotenv import load_dotenv
 load_dotenv()
 
-# ----------------------------------------------------------------------------
-# Imports (after password check and secrets loading)
-# ----------------------------------------------------------------------------
 from travelcompositor_api import TravelCompositorAPI
 from translator import get_translator, required_api_key_env_var
 from state_store import StateStore
@@ -90,9 +76,14 @@ from sync_transfer import (
     fetch_all_transfers,
 )
 
-# ----------------------------------------------------------------------------
-# Constants
-# ----------------------------------------------------------------------------
+# Transport imports
+from sync_transport import (
+    sync_transport,
+    sync_transport_from_data,
+    sync_all_transports_for_supplier,
+    fetch_all_transports,
+)
+
 DEFAULT_TARGET_LANGUAGES = [
     "FR", "SL", "PL", "DE", "SK", "AR", "HR", "HU", "AZ", "NL", "ES", "TR",
     "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS", "TH", "EL", "FI", "JA",
@@ -100,14 +91,10 @@ DEFAULT_TARGET_LANGUAGES = [
 ]
 TEST_LANGUAGES = ["FR", "DE"]
 
-# ----------------------------------------------------------------------------
-# Streamlit UI
-# ----------------------------------------------------------------------------
 st.set_page_config(page_title="Momira Travel — Translator", page_icon="🌐")
 st.title("🌐 Momira Travel — Translation Sync")
-st.caption("Translate Holiday Packages, Tickets, or Transfers (live mode).")
+st.caption("Translate Holiday Packages, Tickets, Transfers, or Transports (live mode).")
 
-# Check for required secrets (after password check)
 missing = [
     k for k in (required_api_key_env_var(), "TRAVELC_USERNAME", "TRAVELC_PASSWORD")
     if not os.getenv(k)
@@ -117,9 +104,6 @@ if missing:
     st.stop()
 
 
-# ----------------------------------------------------------------------------
-# Helper: fetch suppliers (cached)
-# ----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_suppliers():
     try:
@@ -134,12 +118,9 @@ def fetch_suppliers():
         return []
 
 
-# ----------------------------------------------------------------------------
-# Sidebar
-# ----------------------------------------------------------------------------
 with st.sidebar:
     st.header("Settings")
-    entity_type = st.radio("What to translate?", ["Holiday Packages", "Tickets", "Transfers"])
+    entity_type = st.radio("What to translate?", ["Holiday Packages", "Tickets", "Transfers", "Transports"])
 
     if entity_type == "Holiday Packages":
         microsite_id = st.text_input("Microsite ID", value=os.getenv("TRAVELC_MICROSITE_ID", "momiratravel"))
@@ -173,7 +154,7 @@ with st.sidebar:
             limit_input = st.number_input("Limit to first N tickets (0 = no limit)", min_value=0, value=5)
             limit = limit_input or None
 
-    else:  # Transfers
+    elif entity_type == "Transfers":
         suppliers = fetch_suppliers()
         if suppliers:
             supplier_options = {name: id for id, name in suppliers}
@@ -194,6 +175,27 @@ with st.sidebar:
             limit_input = st.number_input("Limit to first N transfers (0 = no limit)", min_value=0, value=5)
             limit = limit_input or None
 
+    else:  # Transports
+        suppliers = fetch_suppliers()
+        if suppliers:
+            supplier_options = {name: id for id, name in suppliers}
+            selected_name = st.selectbox("Select Supplier", options=list(supplier_options.keys()))
+            supplier_id = str(supplier_options[selected_name])
+            st.caption(f"Using supplier ID: {supplier_id}")
+        else:
+            supplier_id = st.text_input("Supplier ID (numeric)", value=os.getenv("TRAVELC_SUPPLIER_ID", ""))
+            if not supplier_id:
+                st.warning("Please enter a supplier ID.")
+
+        scope = st.radio("Which transports?", ["All transports", "One specific transport ID"])
+        transport_id = None
+        if scope == "One specific transport ID":
+            transport_id = st.text_input("Transport ID (e.g., TRANSPORT-412579)")
+        limit = None
+        if scope == "All transports":
+            limit_input = st.number_input("Limit to first N transports (0 = no limit)", min_value=0, value=5)
+            limit = limit_input or None
+
     lang_mode = st.radio(
         "Languages",
         ["Test set (FR, DE)", "All 30 target languages"],
@@ -202,15 +204,11 @@ with st.sidebar:
 
     force = st.checkbox("Force re-translate (ignore tracker)", value=False)
 
-# ----------------------------------------------------------------------------
-# Main area – display target languages and mode
-# ----------------------------------------------------------------------------
 st.write(f"**Target languages:** {', '.join(target_languages)}")
 st.warning("⚠️ Live mode – translations will be written to Travel Compositor immediately.")
 if force:
     st.warning("🔁 Force re-translate is ON – ignores the tracker.")
 
-# Log area placeholder
 log_placeholder = st.empty()
 
 def log_message(msg):
@@ -220,15 +218,11 @@ def log_message(msg):
     log_placeholder.text("\n".join(st.session_state.log_lines[-200:]))
 
 
-# ----------------------------------------------------------------------------
-# Main translate button
-# ----------------------------------------------------------------------------
 if st.button("🚀 Translate now", type="primary"):
     if entity_type != "Holiday Packages" and not supplier_id:
         st.error("Supplier ID is required.")
         st.stop()
 
-    # Clear logs
     st.session_state.log_lines = []
     log_placeholder.empty()
 
@@ -270,7 +264,6 @@ if st.button("🚀 Translate now", type="primary"):
                     main_result["options"] = option_results
                 results = [main_result] if isinstance(main_result, dict) else [main_result] + option_results
             else:
-                # All tickets
                 log_message(f"📋 Fetching tickets for supplier {supplier_id}...")
                 tickets = fetch_all_tickets(api, supplier_id, limit=limit)
                 log_message(f"📋 Found {len(tickets)} ticket(s).")
@@ -320,7 +313,7 @@ if st.button("🚀 Translate now", type="primary"):
                     log_message(f"   ✅ Finished ticket {code}")
                 progress_placeholder.empty()
 
-        else:  # Transfers
+        elif entity_type == "Transfers":
             if scope == "One specific transfer ID":
                 if not transfer_id:
                     st.error("Enter a Transfer ID first.")
@@ -331,7 +324,6 @@ if st.button("🚀 Translate now", type="primary"):
                 )
                 results = [result]
             else:
-                # All transfers
                 log_message(f"📋 Fetching transfers for supplier {supplier_id}...")
                 transfers = fetch_all_transfers(api, supplier_id, limit=limit)
                 log_message(f"📋 Found {len(transfers)} transfer(s).")
@@ -361,9 +353,69 @@ if st.button("🚀 Translate now", type="primary"):
                     log_message(f"   ✅ Finished transfer {transfer_id}")
                 progress_placeholder.empty()
 
-    # ------------------------------------------------------------------------
-    # Show summary
-    # ------------------------------------------------------------------------
+        else:  # Transports
+            if scope == "One specific transport ID":
+                if not transport_id:
+                    st.error("Enter a Transport ID first.")
+                    st.stop()
+                result = sync_transport(
+                    api, translator, store, supplier_id, transport_id, target_languages,
+                    dry_run=False, force=force
+                )
+                results = [result]
+            else:
+                log_message(f"📋 Fetching transports for supplier {supplier_id}...")
+                transports = fetch_all_transports(api, supplier_id, limit=limit)
+                log_message(f"📋 Found {len(transports)} transport(s).")
+                results = []
+                progress_placeholder = st.empty()
+
+                for idx, t in enumerate(transports):
+                    transport_id = t.get("id")
+                    if not transport_id:
+                        log_message(f"⚠️ Skipping transport {idx+1}: no 'id' field")
+                        results.append({"status": "skipped", "reason": "no id field", "raw": t})
+                        continue
+
+                    progress_placeholder.write(f"🔄 Processing transport {idx+1}/{len(transports)}: **{transport_id}**")
+                    log_message(f"🔄 Processing transport {idx+1}/{len(transports)}: {transport_id}")
+
+                    result = sync_transport_from_data(
+                        api, translator, store, supplier_id, t, target_languages,
+                        dry_run=False, force=force
+                    )
+                    if result.get("status") == "up_to_date":
+                        log_message(f"   ✅ Skipped – already translated.")
+                    else:
+                        log_message(f"   → Syncing transport...")
+                    results.append(result)
+
+                    # Sync options
+                    if result.get("status") not in ("fetch_failed", "skipped"):
+                        log_message(f"   → Syncing options for {transport_id}...")
+                        option_results = sync_all_options_for_transport_from_data(
+                            api, translator, store, supplier_id, t, target_languages,
+                            dry_run=False, force=force
+                        )
+                        if isinstance(result, dict):
+                            result["options"] = option_results
+                        else:
+                            results.extend(option_results)
+
+                        if option_results:
+                            up_to_date = sum(1 for r in option_results if r.get('status') == 'up_to_date')
+                            updated = sum(1 for r in option_results if r.get('status') == 'updated')
+                            skipped = sum(1 for r in option_results if r.get('status') == 'skipped')
+                            log_message(f"      Options: {len(option_results)} total, {up_to_date} up-to-date, {updated} updated, {skipped} skipped")
+                            for opt_res in option_results:
+                                opt_code = opt_res.get('option_code', '?')
+                                status = opt_res.get('status', 'unknown')
+                                log_message(f"         - {opt_code}: {status}")
+
+                    log_message(f"   ✅ Finished transport {transport_id}")
+                progress_placeholder.empty()
+
+    # Summary
     by_status = {}
     def count(r):
         if isinstance(r, dict):
