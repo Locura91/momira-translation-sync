@@ -89,10 +89,9 @@ from sync_transport import (
 
 # Hotels
 from sync_hotel import (
-    sync_hotel,
-    sync_hotel_from_data,
-    sync_all_hotels_for_supplier,
-    fetch_all_hotels,
+    sync_hotel,                         # for single hotel
+    sync_all_hotels_for_supplier,       # for all hotels
+    fetch_all_hotels,                   # to fetch list
 )
 
 DEFAULT_TARGET_LANGUAGES = [
