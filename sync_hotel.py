@@ -1,5 +1,6 @@
 """
-sync_hotel.py — Sync hotels (main + rooms + supplements) with translations.
+sync_hotel.py — Sync hotels (main + rooms + supplements + offers) with translations.
+Now includes room descriptions and offers.
 """
 
 import json
@@ -18,8 +19,9 @@ MAX_WORKERS = 5
 
 # ---- Translatable fields ----
 HOTEL_TEXT_FIELDS = ("hotelname", "description")
-ROOM_TEXT_FIELDS = ("name",)
+ROOM_TEXT_FIELDS = ("name", "description")      # added description
 SUPPLEMENT_TEXT_FIELDS = ("description",)
+OFFER_TEXT_FIELDS = ("description",)
 
 
 def strip_html_and_compress(text: str) -> str:
@@ -94,38 +96,52 @@ def build_updated_hotel_descriptions(
     return new_descriptions
 
 
-# ---------- Rooms ----------
+# ---------- Rooms (with description) ----------
 def extract_translatable_fields_from_room(room_entry: Dict[str, Any]) -> Dict[str, str]:
     fields = {}
+    # Top-level name
     name = room_entry.get("name")
     if isinstance(name, str) and name.strip():
         fields["name"] = name
+    # Top-level description
     description = room_entry.get("description")
     if isinstance(description, str) and description.strip():
         fields["description"] = description
+    # Also check translations/datasheets for description if not present top-level
+    if "description" not in fields:
+        translations = room_entry.get("translations", {})
+        en_trans = translations.get("EN") or translations.get("EN_US")
+        if isinstance(en_trans, dict) and en_trans.get("description"):
+            fields["description"] = en_trans["description"]
+        else:
+            datasheets = room_entry.get("datasheets", {})
+            en_ds = datasheets.get("EN") or datasheets.get("EN_US")
+            if isinstance(en_ds, dict) and en_ds.get("description"):
+                fields["description"] = en_ds["description"]
     return fields
 
 
 def get_existing_room_content_for_language(room_entry: Dict[str, Any], lang: str) -> Dict[str, str]:
+    result = {}
+    # Check translations
     translations = room_entry.get("translations", {})
-    lang_entry = translations.get(lang)
-    if isinstance(lang_entry, dict):
-        fields = {}
-        for f in ROOM_TEXT_FIELDS:
-            val = lang_entry.get(f)
-            if isinstance(val, str) and val.strip():
-                fields[f] = val
-        if fields:
-            return fields
+    lang_trans = translations.get(lang)
+    if isinstance(lang_trans, dict):
+        if "name" in lang_trans and lang_trans["name"]:
+            result["name"] = lang_trans["name"]
+        if "description" in lang_trans and lang_trans["description"]:
+            result["description"] = lang_trans["description"]
+        if result:
+            return result
+    # Check datasheets
     datasheets = room_entry.get("datasheets", {})
-    lang_entry = datasheets.get(lang)
-    if isinstance(lang_entry, dict):
-        fields = {}
-        for f in ROOM_TEXT_FIELDS:
-            val = lang_entry.get(f)
-            if isinstance(val, str) and val.strip():
-                fields[f] = val
-        return fields
+    lang_ds = datasheets.get(lang)
+    if isinstance(lang_ds, dict):
+        if "name" in lang_ds and lang_ds["name"]:
+            result["name"] = lang_ds["name"]
+        if "description" in lang_ds and lang_ds["description"]:
+            result["description"] = lang_ds["description"]
+        return result
     return {}
 
 
@@ -190,6 +206,48 @@ def build_updated_supplement(original_supp: Dict[str, Any],
             existing_names.append(new_entry)
     new_supp["names"] = existing_names
     return new_supp
+
+
+# ---------- Offers ----------
+def extract_translatable_fields_from_offer(offer_entry: Dict[str, Any]) -> Dict[str, str]:
+    fields = {}
+    names = offer_entry.get("names", [])
+    for name_obj in names:
+        if name_obj.get("language") == "EN" and name_obj.get("description"):
+            fields["description"] = name_obj["description"]
+            break
+    return fields
+
+
+def get_existing_offer_content_for_language(offer_entry: Dict[str, Any], lang: str) -> Dict[str, str]:
+    names = offer_entry.get("names", [])
+    for name_obj in names:
+        if name_obj.get("language") == lang:
+            desc = name_obj.get("description")
+            if desc:
+                return {"description": desc}
+    return {}
+
+
+def build_updated_offer(original_offer: Dict[str, Any],
+                        translations_by_lang: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
+    new_offer = dict(original_offer)
+    existing_names = [dict(n) for n in new_offer.get("names", [])]
+    existing_langs = {n.get("language") for n in existing_names}
+    for lang, trans in translations_by_lang.items():
+        if lang in existing_langs:
+            for n in existing_names:
+                if n.get("language") == lang:
+                    if "description" in trans:
+                        n["description"] = trans["description"]
+                    break
+        else:
+            new_entry = {"language": lang}
+            if "description" in trans:
+                new_entry["description"] = trans["description"]
+            existing_names.append(new_entry)
+    new_offer["names"] = existing_names
+    return new_offer
 
 
 # ---------- Main sync functions ----------
@@ -323,12 +381,12 @@ def sync_hotel(api, translator, store: StateStore,
                target_languages: List[str],
                dry_run: bool = True, force: bool = False) -> Dict[str, Any]:
     """
-    Sync a hotel: main, rooms, supplements. Returns result with status for each.
+    Sync a hotel: main, rooms, supplements, offers. Returns result with status for each.
     """
     # ---- Main hotel ----
     main_result = sync_hotel_main(api, translator, store, supplier_id, hotel_entry,
                                   target_languages, dry_run=dry_run, force=force)
-    results = {"main": main_result, "rooms": [], "supplements": []}
+    results = {"main": main_result, "rooms": [], "supplements": [], "offers": []}
 
     # ---- Rooms ----
     rooms = hotel_entry.get("rooms", [])
@@ -350,9 +408,21 @@ def sync_hotel(api, translator, store: StateStore,
             supp_results.append(supp_result)
         results["supplements"] = supp_results
 
-    # ---- Build updated payload if any room or supplement was updated ----
+    # ---- Offers ----
+    offers = hotel_entry.get("offers", [])
+    if offers:
+        offer_results = []
+        for offer in offers:
+            offer_result = sync_offer(api, translator, store, supplier_id, hotel_entry, offer,
+                                      target_languages, dry_run=dry_run, force=force)
+            offer_results.append(offer_result)
+        results["offers"] = offer_results
+
+    # ---- Build updated payload if any room, supplement, or offer was updated ----
     any_updated = False
     updated_hotel = dict(hotel_entry)
+
+    # Rooms
     if rooms and any(r.get("status") == "updated" for r in room_results):
         new_rooms = []
         for idx, room in enumerate(rooms):
@@ -363,6 +433,8 @@ def sync_hotel(api, translator, store: StateStore,
                 new_rooms.append(room)
         updated_hotel["rooms"] = new_rooms
         any_updated = True
+
+    # Supplements
     if supplements and any(s.get("status") == "updated" for s in supp_results):
         new_supps = []
         for idx, supp in enumerate(supplements):
@@ -374,11 +446,23 @@ def sync_hotel(api, translator, store: StateStore,
         updated_hotel["supplements"] = new_supps
         any_updated = True
 
+    # Offers
+    if offers and any(o.get("status") == "updated" for o in offer_results):
+        new_offers = []
+        for idx, offer in enumerate(offers):
+            o = offer_results[idx]
+            if o.get("status") == "updated" and "updated_offer" in o:
+                new_offers.append(o["updated_offer"])
+            else:
+                new_offers.append(offer)
+        updated_hotel["offers"] = new_offers
+        any_updated = True
+
     if any_updated and not dry_run:
         # Send PUT with updated hotel
         result = api.update_hotel(supplier_id, updated_hotel)
         if isinstance(result, dict) and "error" in result:
-            # Mark put_failed for rooms/supps
+            # Mark put_failed for rooms/supps/offers
             for r in room_results:
                 if r.get("status") == "updated":
                     r["status"] = "put_failed"
@@ -387,10 +471,15 @@ def sync_hotel(api, translator, store: StateStore,
                 if s.get("status") == "updated":
                     s["status"] = "put_failed"
                     s["detail"] = result
+            for o in offer_results:
+                if o.get("status") == "updated":
+                    o["status"] = "put_failed"
+                    o["detail"] = result
             results["rooms"] = room_results
             results["supplements"] = supp_results
+            results["offers"] = offer_results
         else:
-            # Update state for rooms and supplements that were written
+            # Update state for rooms, supplements, offers
             for r in room_results:
                 if r.get("status") == "updated" and "languages_written" in r:
                     room_provider_code = r.get("room_code")
@@ -411,6 +500,16 @@ def sync_hotel(api, translator, store: StateStore,
                     prior_langs = prior_state["translated_languages"] if prior_state else []
                     all_langs = sorted(set(prior_langs) | set(s["languages_written"]))
                     store.upsert_state("hotel_supplement", supplier_id, entity_id, supp_source_hash, all_langs, option_code=supp_provider_code)
+            for o in offer_results:
+                if o.get("status") == "updated" and "languages_written" in o:
+                    offer_provider_code = o.get("offer_code")
+                    entity_id = f"{hotel_entry.get('contractId')}|offer|{offer_provider_code}"
+                    translatable_offer = extract_translatable_fields_from_offer(offer)
+                    offer_source_hash = compute_hash(translatable_offer)
+                    prior_state = store.get_state("hotel_offer", supplier_id, entity_id, option_code=offer_provider_code)
+                    prior_langs = prior_state["translated_languages"] if prior_state else []
+                    all_langs = sorted(set(prior_langs) | set(o["languages_written"]))
+                    store.upsert_state("hotel_offer", supplier_id, entity_id, offer_source_hash, all_langs, option_code=offer_provider_code)
 
     return results
 
@@ -625,6 +724,113 @@ def sync_supplement(api, translator, store: StateStore,
         "status": "updated",
         "supplement_code": supp_provider_code,
         "updated_supplement": updated_supp,
+        "languages_written": list(successful.keys())
+    }
+
+
+# ---------- Offer sync ----------
+def sync_offer(api, translator, store: StateStore,
+               supplier_id: str, hotel_entry: Dict[str, Any],
+               offer_entry: Dict[str, Any], target_languages: List[str],
+               dry_run: bool = True, force: bool = False) -> Dict[str, Any]:
+    contract_id = hotel_entry.get("contractId")
+    offer_provider_code = offer_entry.get("providerCode")
+    if not offer_provider_code:
+        return {"status": "skipped", "reason": "no providerCode in offer"}
+
+    translatable = extract_translatable_fields_from_offer(offer_entry)
+    if not translatable:
+        return {"status": "skipped", "offer_code": offer_provider_code, "reason": "no translatable fields"}
+
+    source_hash = compute_hash(translatable)
+    entity_id = f"{contract_id}|offer|{offer_provider_code}"
+    if force:
+        needed = list(target_languages)
+    else:
+        state = store.get_state("hotel_offer", supplier_id, entity_id, option_code=offer_provider_code)
+        if state is None or state["source_hash"] != source_hash:
+            needed = list(target_languages)
+        else:
+            already_done = set(state["translated_languages"])
+            needed = [lang for lang in target_languages if lang not in already_done]
+        # Verify
+        truly_needed = []
+        languages_to_add = []
+        for lang in needed:
+            existing = get_existing_offer_content_for_language(offer_entry, lang)
+            if not existing:
+                truly_needed.append(lang)
+                continue
+            is_identical = True
+            for field, src in translatable.items():
+                if existing.get(field) != src:
+                    is_identical = False
+                    break
+            if is_identical:
+                truly_needed.append(lang)
+            else:
+                languages_to_add.append(lang)
+        if languages_to_add:
+            prior_state = store.get_state("hotel_offer", supplier_id, entity_id, option_code=offer_provider_code)
+            prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
+            all_langs = sorted(set(prior_langs) | set(languages_to_add))
+            store.upsert_state("hotel_offer", supplier_id, entity_id, source_hash, all_langs, option_code=offer_provider_code)
+        needed = truly_needed
+
+    # Self-healing
+    if not needed:
+        sample_lang = "FR" if "FR" in target_languages else target_languages[0] if target_languages else "EN"
+        existing = get_existing_offer_content_for_language(offer_entry, sample_lang)
+        if existing:
+            is_identical = True
+            for field, src in translatable.items():
+                if existing.get(field) != src:
+                    is_identical = False
+                    break
+            if is_identical:
+                print(f"🔍 Offer verification: {sample_lang} identical. Re-translating.")
+                needed = list(target_languages)
+            else:
+                return {"status": "up_to_date", "offer_code": offer_provider_code}
+        else:
+            print(f"🔍 Offer verification: {sample_lang} missing. Re-translating.")
+            needed = list(target_languages)
+
+    if not needed:
+        return {"status": "up_to_date", "offer_code": offer_provider_code}
+
+    # Translate
+    compressed = compress_translatable_fields(translatable)
+    combined = {}
+    total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
+    for i in range(0, len(needed), BATCH_SIZE):
+        batch = needed[i:i+BATCH_SIZE]
+        print(f"   Offer {offer_provider_code} batch {i//BATCH_SIZE+1}/{total_batches}: {batch}")
+        batch_result = translator.translate_fields(compressed, batch)
+        combined.update(batch_result)
+        if i + BATCH_SIZE < len(needed):
+            time.sleep(DELAY_BETWEEN_BATCHES)
+
+    successful = {}
+    for lang, trans in combined.items():
+        changed = False
+        for field, src in translatable.items():
+            if trans.get(field) != src:
+                changed = True
+                break
+        if changed:
+            successful[lang] = trans
+        else:
+            print(f"⚠️  Offer translation for {lang} identical; skipping.")
+
+    if not successful:
+        return {"status": "skipped", "offer_code": offer_provider_code, "reason": "no successful translations"}
+
+    updated_offer = build_updated_offer(offer_entry, successful)
+    return {
+        "status": "updated",
+        "offer_code": offer_provider_code,
+        "updated_offer": updated_offer,
         "languages_written": list(successful.keys())
     }
 
