@@ -1,6 +1,5 @@
 """
-streamlit_app.py — the "Translate now" button, now for Holiday Packages AND Tickets.
-With visual progress for "All tickets" runs.
+streamlit_app.py — with supplier dropdown for tickets.
 """
 
 import os
@@ -63,6 +62,23 @@ if missing:
     st.error(f"Missing required secret(s): {', '.join(missing)}. Add them in Streamlit Cloud Secrets or local .env.")
     st.stop()
 
+# ----- Helper to fetch suppliers (cached) -----
+@st.cache_data(ttl=300)  # cache for 5 minutes
+def fetch_suppliers():
+    """Fetch supplier list from Travel Compositor and return a list of (id, name)."""
+    try:
+        api = TravelCompositorAPI()
+        suppliers = api.get_all_suppliers()
+        if not suppliers:
+            return []
+        # Sort by commercialName
+        suppliers_sorted = sorted(suppliers, key=lambda s: s.get('commercialName', '').lower())
+        return [(s['id'], s.get('commercialName', f"Supplier {s['id']}")) for s in suppliers_sorted]
+    except Exception as e:
+        st.warning(f"Could not fetch suppliers: {e}")
+        return []
+
+
 with st.sidebar:
     st.header("Settings")
     entity_type = st.radio("What to translate?", ["Holiday Packages", "Tickets"])
@@ -79,9 +95,20 @@ with st.sidebar:
             limit = limit_input or None
 
     else:  # Tickets
-        supplier_id = st.text_input("Supplier ID (numeric)", value=os.getenv("TRAVELC_SUPPLIER_ID", ""))
-        if not supplier_id:
-            st.warning("Please set TRAVELC_SUPPLIER_ID in secrets or enter it here.")
+        # ---- Supplier selection ----
+        suppliers = fetch_suppliers()
+        if suppliers:
+            # Use selectbox
+            supplier_options = {name: id for id, name in suppliers}
+            selected_name = st.selectbox("Select Supplier", options=list(supplier_options.keys()))
+            supplier_id = str(supplier_options[selected_name])
+            st.caption(f"Using supplier ID: {supplier_id}")
+        else:
+            # Fallback to manual entry
+            supplier_id = st.text_input("Supplier ID (numeric)", value=os.getenv("TRAVELC_SUPPLIER_ID", ""))
+            if not supplier_id:
+                st.warning("Please enter a supplier ID.")
+
         scope = st.radio("Which tickets?", ["All tickets", "One specific ticket code"])
         ticket_code = None
         if scope == "One specific ticket code":
@@ -109,6 +136,11 @@ if force:
     st.warning("🔁 Force re-translate is ON — ignores the tracker.")
 
 if st.button("🚀 Translate now", type="primary"):
+    # Validate
+    if entity_type == "Tickets" and not supplier_id:
+        st.error("Supplier ID is required.")
+        st.stop()
+
     api = TravelCompositorAPI()
     translator = get_translator()
     store = StateStore()
@@ -131,9 +163,6 @@ if st.button("🚀 Translate now", type="primary"):
                 )
 
         else:  # Tickets
-            if not supplier_id:
-                st.error("Supplier ID is required.")
-                st.stop()
             if scope == "One specific ticket code":
                 if not ticket_code:
                     st.error("Enter a Ticket Code first.")
