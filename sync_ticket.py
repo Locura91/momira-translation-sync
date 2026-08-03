@@ -1,5 +1,5 @@
 """
-sync_ticket.py — Simplified single-pass sync for tickets (Claude only).
+sync_ticket.py — Simplified single-pass sync for tickets (Claude friendly).
 """
 
 import json
@@ -102,7 +102,6 @@ def sync_ticket(api, translator, store: StateStore,
         if i + BATCH_SIZE < len(needed):
             time.sleep(DELAY_BETWEEN_BATCHES)
 
-    # Filter out languages that returned identical to source (should be rare)
     successful = {}
     for lang, trans in combined_translations.items():
         changed = False
@@ -127,7 +126,6 @@ def sync_ticket(api, translator, store: StateStore,
         return {"status": "dry_run_preview", "ticket_code": ticket_code,
                 "languages": list(successful.keys()), "preview": preview}
 
-    # Write
     payload = dict(ticket)
     payload["datasheets"] = new_datasheets
     result = api.update_ticket(supplier_id, payload)
