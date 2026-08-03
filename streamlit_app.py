@@ -44,7 +44,7 @@ DEFAULT_TARGET_LANGUAGES = [
     "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS", "TH", "EL", "FI", "JA",
     "SR", "PT", "DA", "IT", "MS", "SQ",
 ]
-TEST_LANGUAGES = ["FR", "DE"]
+TEST_LANGUAGES = ["PL"]
 
 st.set_page_config(page_title="Momira Travel — Translator", page_icon="🌐")
 st.title("🌐 Momira Travel — Translation Sync")
