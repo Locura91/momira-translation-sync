@@ -1,6 +1,6 @@
 """
 sync_transport.py — Sync transports (main + options) with translations.
-Fixed: add missing airlineCode to prevent 400 error.
+Fixed: always sync options, even if main is up_to_date.
 """
 
 import json
@@ -232,7 +232,6 @@ def sync_transport_from_data(
     write_start = time.time()
     payload = dict(transport_entry)
     payload["datasheets"] = new_datasheets
-    # --- FIX: add missing airlineCode ---
     payload.setdefault("airlineCode", "")
     result = api.update_transport(supplier_id, payload)
     write_time = time.time() - write_start
@@ -321,14 +320,12 @@ def build_updated_option(original_option: Dict[str, Any],
     new_map = dict(original_map)
 
     for lang, trans in translations_by_lang.items():
-        # For translations, we expect a dict per language
         if isinstance(original_map.get(lang), dict):
             base = dict(original_map.get(lang, {}))
         else:
             base = {}
         for field, text in trans.items():
             base[field] = text
-        # If target_key is "remarks" and we only have one field "remarks", flatten
         if target_key == "remarks" and len(trans) == 1 and "remarks" in trans:
             new_map[lang] = trans["remarks"]
         else:
@@ -490,18 +487,31 @@ def sync_all_transports_for_supplier(
 
     results = []
     for t in transports:
-        result = sync_transport_from_data(
+        transport_id = t.get("id")
+        if not transport_id:
+            results.append({"status": "skipped", "reason": "no id field", "raw": t})
+            continue
+
+        # Sync main transport
+        main_result = sync_transport_from_data(
             api, translator, store, supplier_id, t, target_languages,
             dry_run=dry_run, force=force
         )
-        if result.get("status") not in ("fetch_failed", "skipped"):
+        results.append(main_result)
+
+        # Always sync options (unless main fetch failed or skipped due to no datasheets)
+        # But we check if the transport has optionCodes
+        if t.get("optionCodes"):
             option_results = sync_all_options_for_transport_from_data(
                 api, translator, store, supplier_id, t, target_languages,
                 dry_run=dry_run, force=force
             )
-            if isinstance(result, dict):
-                result["options"] = option_results
+            if isinstance(main_result, dict):
+                main_result["options"] = option_results
             else:
                 results.extend(option_results)
-        results.append(result)
+        else:
+            # No options, just skip
+            if isinstance(main_result, dict):
+                main_result["options"] = [{"status": "skipped", "reason": "no options"}]
     return results
