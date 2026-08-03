@@ -1,6 +1,6 @@
 """
 sync_holiday_package.py — GET -> translate -> PUT loop for Holiday Packages.
-Now filters out languages where translation is identical to the source.
+Now with batching to avoid token limits and filters out languages where translation is identical to source.
 """
 
 import json
@@ -14,12 +14,17 @@ WRITABLE_FIELDS = (
     "active", "title", "largeTitle", "description", "remarks",
     "visible", "order", "autocancelable",
 )
+BATCH_SIZE = 5  # Translate this many languages per API call
 
 
 def filter_successful_translations(
     translations: Dict[str, Dict[str, str]],
     source_fields: Dict[str, str]
 ) -> Dict[str, Dict[str, str]]:
+    """
+    Return only languages where at least one field's translation differs from
+    the source. Logs warnings for skipped languages.
+    """
     successful = {}
     for lang, trans in translations.items():
         changed = False
@@ -35,6 +40,7 @@ def filter_successful_translations(
 
 
 def extract_translatable_fields(package_entry: Dict[str, Any]) -> Dict[str, str]:
+    """Pull out title, description, ribbonText – only if present and non‑empty."""
     fields: Dict[str, str] = {}
     for key in TEXT_FIELDS:
         val = package_entry.get(key)
@@ -45,6 +51,10 @@ def extract_translatable_fields(package_entry: Dict[str, Any]) -> Dict[str, str]
 
 def build_updated_package_payload(original_entry: Dict[str, Any],
                                   lang_fields: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Build the PUT payload for one language, using only the writable fields
+    and swapping in translated title/description/ribbonText.
+    """
     payload: Dict[str, Any] = {}
     for key in WRITABLE_FIELDS:
         if key in original_entry:
@@ -57,6 +67,7 @@ def build_updated_package_payload(original_entry: Dict[str, Any],
 
 def fetch_holiday_package_by_id(api, microsite_id: str, package_id: str,
                                 lang: str = "EN", page_size: int = 100) -> Optional[Dict[str, Any]]:
+    """Fetch a specific holiday package by ID (paging through the list)."""
     first_result = 0
     seen = 0
     while True:
@@ -79,6 +90,7 @@ def fetch_holiday_package_by_id(api, microsite_id: str, package_id: str,
 
 def fetch_all_holiday_packages(api, microsite_id: str, lang: str = "EN",
                                page_size: int = 100, limit: int = None) -> List[Dict[str, Any]]:
+    """Page through all holiday packages for a microsite."""
     all_packages: List[Dict[str, Any]] = []
     first_result = 0
     while True:
@@ -104,10 +116,12 @@ def sync_one_package_entry(api, translator, store: StateStore,
                            microsite_id: str, entry: Dict[str, Any],
                            target_languages: List[str],
                            dry_run: bool = True, force: bool = False) -> Dict[str, Any]:
+    """Sync one package entry (already fetched from the list)."""
     package_id = entry.get("id")
     if package_id is None:
         return {"status": "skipped", "reason": "no 'id' field on package entry"}
 
+    # Only translate active packages
     if entry.get("active") is not True:
         return {"status": "skipped", "package_id": package_id, "reason": "active is not true"}
 
@@ -123,11 +137,16 @@ def sync_one_package_entry(api, translator, store: StateStore,
     if not needed:
         return {"status": "up_to_date", "package_id": package_id}
 
-    print(f"🌐 Translating package {package_id} ('{entry.get('title', '')}'): fields={list(translatable.keys())} -> {needed}")
-    all_translations = translator.translate_fields(translatable, needed)
+    # --- BATCH TRANSLATIONS ---
+    combined_translations = {}
+    for i in range(0, len(needed), BATCH_SIZE):
+        batch = needed[i:i+BATCH_SIZE]
+        print(f"🌐 Translating package {package_id} (batch {i//BATCH_SIZE + 1}): {batch}")
+        batch_result = translator.translate_fields(translatable, batch)
+        combined_translations.update(batch_result)
 
     # Filter out languages that didn't actually change
-    translations = filter_successful_translations(all_translations, translatable)
+    translations = filter_successful_translations(combined_translations, translatable)
     if not translations:
         return {"status": "skipped", "package_id": package_id,
                 "reason": "no successful translations (all identical to source)"}
@@ -147,6 +166,7 @@ def sync_one_package_entry(api, translator, store: StateStore,
                 per_lang_status[lang] = "written"
                 written_languages.append(lang)
 
+    # Update state only for languages that were actually written
     if not dry_run and written_languages:
         prior_state = store.get_state(ENTITY_TYPE, microsite_id, package_id)
         prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
@@ -164,6 +184,7 @@ def sync_holiday_package(api, translator, store: StateStore,
                          microsite_id: str, package_id: str,
                          target_languages: List[str],
                          dry_run: bool = True, force: bool = False) -> Dict[str, Any]:
+    """Sync a single holiday package by ID."""
     entry = fetch_holiday_package_by_id(api, microsite_id, package_id)
     if entry is None:
         return {"status": "fetch_failed", "package_id": package_id}
@@ -175,6 +196,7 @@ def sync_all_holiday_packages(api, translator, store: StateStore,
                               microsite_id: str, target_languages: List[str],
                               dry_run: bool = True, limit: int = None,
                               force: bool = False) -> List[Dict[str, Any]]:
+    """Sync all holiday packages for a microsite."""
     packages = fetch_all_holiday_packages(api, microsite_id, limit=limit)
     print(f"📋 Found {len(packages)} holiday package(s) for microsite '{microsite_id}'.")
 
