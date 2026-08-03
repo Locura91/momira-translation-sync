@@ -1,34 +1,5 @@
 """
-translator.py — AI translation engine for the nbext sync tool.
-
-Two providers are implemented, both behind the SAME interface
-(translate_fields(source_fields, target_languages) -> {lang: {field: text}}),
-so sync_engine.py / sync_holiday_package.py never need to know or care
-which one is active:
-
-  - GeminiTranslator (Google Gemini 2.5 Flash) — DEFAULT, chosen for lowest
-    cost per your comparison (~half the cost of Claude Haiku for this
-    batched-per-entity translation job).
-  - ClaudeTranslator (Claude Haiku via Anthropic) — kept working in case
-    you want to switch back; same batching approach, slightly higher cost.
-
-Both translate a whole entity's text fields into ALL requested target
-languages in ONE API call (using each provider's structured-output /
-JSON-schema feature to get back reliable JSON instead of parsing free
-text) — this is what keeps cost down: 1 API call per entity instead of
-1 call per entity per language.
-
-Which one runs is controlled by the TRANSLATION_PROVIDER env var
-("gemini" or "claude", default "gemini") — see .env.example.
-
-Setup required before this file will run (Gemini, the default):
-  pip install google-genai
-  export GEMINI_API_KEY=...   (or put it in your .env file — see README
-  "Step 1b — Get a Gemini API key" for where to get this)
-
-Setup required for the Claude fallback:
-  pip install anthropic
-  export ANTHROPIC_API_KEY=sk-ant-...
+translator.py — AI translation engine with fallback (Gemini first, then Claude).
 """
 
 import os
@@ -40,13 +11,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Anthropic model used for translation, if TRANSLATION_PROVIDER=claude.
+# Default models
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
-
-# Gemini model used for translation, if TRANSLATION_PROVIDER=gemini (default).
-# gemini-2.5-flash is the stable (non-preview) Flash model — deliberately not
-# the newer "gemini-3-flash-preview"/"gemini-3.5-flash", since preview models
-# can change/disappear without notice and this is a production glue script.
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 TRANSLATION_TOOL = {
@@ -97,9 +63,10 @@ class TranslationError(Exception):
     pass
 
 
-# Shared prompt text used by both providers so the actual translation
-# instructions (domain preservation, tone, locale variants) don't drift
-# apart if we ever tweak one and forget the other.
+class ProviderRateLimitError(Exception):
+    pass
+
+
 USER_PROMPT_TEMPLATE = (
     "Translate the following fields from English into these target languages: "
     "{languages}.\n\n"
@@ -111,7 +78,7 @@ USER_PROMPT_TEMPLATE = (
 
 class ClaudeTranslator:
     def __init__(self, api_key: str = None, model: str = None):
-        from anthropic import Anthropic  # imported lazily so Gemini-only setups don't need this package
+        from anthropic import Anthropic
         self.client = Anthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
         self.model = model or os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
 
@@ -119,20 +86,8 @@ class ClaudeTranslator:
         self,
         source_fields: Dict[str, str],
         target_languages: List[str],
-        retries: int = 5,  # increased for rate-limit resilience
+        retries: int = 5,
     ) -> Dict[str, Dict[str, str]]:
-        """
-        source_fields: {"title": "Airport Transfer to Hotel", "description": "..."}
-        target_languages: ["ES", "FR", "DE", ...]
-
-        Returns: {"ES": {"title": "...", "description": "..."}, "FR": {...}, ...}
-
-        On any failure (API error, missing language/field in the response), falls
-        back to the English source text for the affected language/field and keeps
-        going — this mirrors the design doc's fallback rule: never block the whole
-        run over one bad translation, but never fabricate silently either (a warning
-        is printed for every fallback used).
-        """
         non_empty_fields = {k: v for k, v in source_fields.items() if isinstance(v, str) and v.strip()}
         if not non_empty_fields:
             return {lang: dict(source_fields) for lang in target_languages}
@@ -145,13 +100,12 @@ class ClaudeTranslator:
             f"every field listed above translated into that language."
         )
 
-        last_error = None
         raw_translations = {}
         for attempt in range(retries + 1):
             try:
                 response = self.client.messages.create(
                     model=self.model,
-                    max_tokens=8192,  # Claude Haiku output limit
+                    max_tokens=8192,
                     system=SYSTEM_PROMPT,
                     tools=[TRANSLATION_TOOL],
                     tool_choice={"type": "tool", "name": "submit_translations"},
@@ -164,8 +118,6 @@ class ClaudeTranslator:
                 raw_translations = tool_use.input.get("translations", {})
                 break
             except Exception as e:
-                last_error = e
-                # Check for rate-limit (HTTP 429)
                 is_rate_limit = False
                 if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
                     is_rate_limit = e.response.status_code == 429
@@ -173,19 +125,18 @@ class ClaudeTranslator:
                     is_rate_limit = True
 
                 if is_rate_limit:
-                    wait = (2 ** attempt) * 5  # 5, 10, 20, 40, 80 seconds
+                    wait = (2 ** attempt) * 5
                     print(f"🚦 Claude rate limit hit (attempt {attempt+1}). Waiting {wait}s before retry...")
                     time.sleep(wait)
                 else:
-                    print(f"⚠️  Translation call failed (attempt {attempt+1}/{retries+1}): {e}")
+                    print(f"⚠️  Claude call failed (attempt {attempt+1}/{retries+1}): {e}")
                     if attempt < retries:
                         time.sleep(2 ** attempt)
 
                 if attempt == retries:
-                    print(f"❌ Giving up after {retries+1} attempts — falling back to English for ALL languages.")
-                    raw_translations = {}
+                    raise ProviderRateLimitError(f"Claude rate limit exhausted after {retries+1} attempts")
 
-        # Build the final result, filling any gaps with the English source
+        # Build result, filling gaps
         result = {}
         for lang in target_languages:
             lang_result = {}
@@ -202,13 +153,6 @@ class ClaudeTranslator:
 
 
 def _build_gemini_response_schema(fields: Dict[str, str], target_languages: List[str]) -> dict:
-    """
-    Builds a JSON schema forcing Gemini to return exactly:
-      {"translations": {"FR": {"title": "...", "description": "..."}, "DE": {...}, ...}}
-    with every requested language AND every requested field required — same
-    guarantee Claude's forced tool_choice gives us, via Gemini's structured
-    JSON output feature instead.
-    """
     field_names = list(fields.keys())
     per_language_schema = {
         "type": "object",
@@ -229,10 +173,8 @@ def _build_gemini_response_schema(fields: Dict[str, str], target_languages: List
 
 
 class GeminiTranslator:
-    """Same public interface as ClaudeTranslator — a drop-in replacement."""
-
     def __init__(self, api_key: str = None, model: str = None):
-        from google import genai  # imported lazily so Claude-only setups don't need this package
+        from google import genai
         self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
         self.model = model or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
 
@@ -240,7 +182,7 @@ class GeminiTranslator:
         self,
         source_fields: Dict[str, str],
         target_languages: List[str],
-        retries: int = 5,  # increased for rate-limit resilience
+        retries: int = 5,
     ) -> Dict[str, Dict[str, str]]:
         non_empty_fields = {k: v for k, v in source_fields.items() if isinstance(v, str) and v.strip()}
         if not non_empty_fields:
@@ -252,7 +194,6 @@ class GeminiTranslator:
             fields_json=json.dumps(non_empty_fields, ensure_ascii=False, indent=2),
         )
 
-        last_error = None
         raw_translations = {}
         for attempt in range(retries + 1):
             try:
@@ -264,38 +205,34 @@ class GeminiTranslator:
                         "response_mime_type": "application/json",
                         "response_json_schema": schema,
                         "thinking_config": {"thinking_budget": 0},
-                        "max_output_tokens": 8192,   # Gemini 2.5 Flash max output
-                        "timeout": 60,               # per‑request timeout
+                        "max_output_tokens": 8192,
+                        "timeout": 60,
                     },
                 )
                 parsed = json.loads(response.text)
                 raw_translations = parsed.get("translations", {})
                 if not raw_translations:
                     raise TranslationError("Model returned no 'translations' key")
-                break  # success
+                break
             except Exception as e:
-                last_error = e
-                # Check for rate-limit (HTTP 429)
                 is_rate_limit = False
                 if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
                     is_rate_limit = e.response.status_code == 429
-                if not is_rate_limit and '429' in str(e):
+                if not is_rate_limit and ('429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e)):
                     is_rate_limit = True
 
                 if is_rate_limit:
-                    wait = (2 ** attempt) * 5  # 5, 10, 20, 40, 80 seconds
+                    wait = (2 ** attempt) * 5
                     print(f"🚦 Gemini rate limit hit (attempt {attempt+1}). Waiting {wait}s before retry...")
                     time.sleep(wait)
                 else:
-                    print(f"⚠️  Translation call failed (attempt {attempt+1}/{retries+1}): {e}")
+                    print(f"⚠️  Gemini call failed (attempt {attempt+1}/{retries+1}): {e}")
                     if attempt < retries:
                         time.sleep(2 ** attempt)
 
                 if attempt == retries:
-                    print(f"❌ Giving up after {retries+1} attempts — falling back to English for ALL languages.")
-                    raw_translations = {}
+                    raise ProviderRateLimitError(f"Gemini rate limit exhausted after {retries+1} attempts")
 
-        # Same per-language, per-field fallback logic as ClaudeTranslator
         result = {}
         for lang in target_languages:
             lang_result = {}
@@ -311,26 +248,55 @@ class GeminiTranslator:
         return result
 
 
+class FallbackTranslator:
+    def __init__(self, primary: GeminiTranslator, fallback: ClaudeTranslator):
+        self.primary = primary
+        self.fallback = fallback
+
+    def translate_fields(
+        self,
+        source_fields: Dict[str, str],
+        target_languages: List[str],
+        retries: int = 5,
+    ) -> Dict[str, Dict[str, str]]:
+        try:
+            result = self.primary.translate_fields(source_fields, target_languages, retries)
+            # Check if all languages are still English (no changes)
+            all_english = True
+            for lang in target_languages:
+                for field, src in source_fields.items():
+                    if result.get(lang, {}).get(field) != src:
+                        all_english = False
+                        break
+                if not all_english:
+                    break
+            if all_english:
+                print("⚠️  Primary provider returned only English fallback. Switching to Claude for this batch...")
+                return self.fallback.translate_fields(source_fields, target_languages, retries)
+            return result
+        except (ProviderRateLimitError, Exception) as e:
+            print(f"⚠️  Primary provider failed: {e}. Switching to Claude for this batch...")
+            return self.fallback.translate_fields(source_fields, target_languages, retries)
+
+
 def required_api_key_env_var() -> str:
-    """Which env var an entrypoint script should check for before starting, based on TRANSLATION_PROVIDER."""
     provider = (os.getenv("TRANSLATION_PROVIDER") or "gemini").strip().lower()
+    if provider == "fallback":
+        return "GEMINI_API_KEY"
     return "GEMINI_API_KEY" if provider == "gemini" else "ANTHROPIC_API_KEY"
 
 
 def get_translator(api_key: str = None, model: str = None):
-    """
-    Factory: returns whichever translator TRANSLATION_PROVIDER selects
-    ("gemini" or "claude", default "gemini" per your cost comparison).
-    Every run_sync*.py / streamlit_app.py entrypoint should call this
-    instead of instantiating ClaudeTranslator/GeminiTranslator directly,
-    so switching providers later is a one-line .env change.
-    """
     provider = (os.getenv("TRANSLATION_PROVIDER") or "gemini").strip().lower()
     if provider == "gemini":
         return GeminiTranslator(api_key=api_key, model=model)
     elif provider == "claude":
         return ClaudeTranslator(api_key=api_key, model=model)
+    elif provider == "fallback":
+        gemini = GeminiTranslator(api_key=os.getenv("GEMINI_API_KEY"), model=model)
+        claude = ClaudeTranslator(api_key=os.getenv("ANTHROPIC_API_KEY"), model=model)
+        return FallbackTranslator(gemini, claude)
     else:
         raise ValueError(
-            f"Unknown TRANSLATION_PROVIDER '{provider}' — expected 'gemini' or 'claude'."
+            f"Unknown TRANSLATION_PROVIDER '{provider}' — expected 'gemini', 'claude', or 'fallback'."
         )
