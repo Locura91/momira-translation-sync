@@ -1,18 +1,18 @@
 """
-sync_ticket.py — Optimized with sync_ticket_from_data to avoid extra GET.
+sync_ticket.py — Optimized with progress for options and no extra GET.
 """
 
 import json
 import re
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
 
 from state_store import StateStore, compute_hash
 from translator import get_translator
 
 # ---- Configuration ----
 BATCH_SIZE = 10
-DELAY_BETWEEN_BATCHES = 2   # Reduced (Claude paid tier)
+DELAY_BETWEEN_BATCHES = 2
 
 # ---- Main ticket fields ----
 TEXT_FIELDS = ("name", "description", "meetingPoint", "activityType",
@@ -150,7 +150,7 @@ def verify_and_filter_needed(
     return truly_needed
 
 
-# ----- New function: sync from already fetched ticket data -----
+# ----- Main ticket sync from pre-fetched data -----
 def sync_ticket_from_data(
     api,
     translator,
@@ -185,7 +185,6 @@ def sync_ticket_from_data(
     if not needed:
         return {"status": "up_to_date", "ticket_code": ticket_code}
 
-    # Compress source text
     compressed_translatable = compress_translatable_fields(translatable)
 
     print(f"🌐 Translating ticket {ticket_code}: {len(needed)} languages")
@@ -237,7 +236,7 @@ def sync_ticket_from_data(
     return {"status": "updated", "ticket_code": ticket_code, "languages_written": written_langs}
 
 
-# Keep original sync_ticket as wrapper (for single ticket mode)
+# Original sync_ticket wrapper (for single ticket mode)
 def sync_ticket(api, translator, store: StateStore,
                 supplier_id: str, ticket_code: str,
                 target_languages: List[str],
@@ -249,7 +248,7 @@ def sync_ticket(api, translator, store: StateStore,
                                  target_languages, dry_run=dry_run, force=force)
 
 
-# ---- Option functions (unchanged) ----
+# ---- Option functions ----
 def get_existing_option_content(option_entry: Dict[str, Any], lang: str) -> Dict[str, str]:
     fields = {}
     remarks = option_entry.get("remarks", {})
@@ -321,15 +320,20 @@ def build_updated_option(original_option: Dict[str, Any],
     return new_option
 
 
-def sync_ticket_option(api, translator, store: StateStore,
-                       supplier_id: str, ticket_code: str, option_code: str,
-                       target_languages: List[str],
-                       dry_run: bool = True, force: bool = False) -> Dict[str, Any]:
-    option = api.get_ticket_option(supplier_id, ticket_code, option_code)
-    if isinstance(option, dict) and "error" in option:
-        return {"status": "fetch_failed", "option_code": option_code, "detail": option}
-
-    translatable = extract_translatable_fields_from_option(option)
+def sync_ticket_option_from_data(
+    api,
+    translator,
+    store: StateStore,
+    supplier_id: str,
+    option_entry: Dict[str, Any],
+    ticket_code: str,
+    option_code: str,
+    target_languages: List[str],
+    dry_run: bool = True,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Sync one option using pre‑fetched option data."""
+    translatable = extract_translatable_fields_from_option(option_entry)
     if not translatable:
         return {"status": "skipped", "option_code": option_code, "reason": "no translatable fields"}
 
@@ -340,7 +344,7 @@ def sync_ticket_option(api, translator, store: StateStore,
     else:
         needed = verify_and_filter_needed(
             store, "ticket_option", supplier_id, entity_id, source_hash,
-            target_languages, option, translatable, option_code=option_code
+            target_languages, option_entry, translatable, option_code=option_code
         )
 
     if not needed:
@@ -373,7 +377,7 @@ def sync_ticket_option(api, translator, store: StateStore,
     if not successful:
         return {"status": "skipped", "option_code": option_code, "reason": "no successful translations"}
 
-    updated_option = build_updated_option(option, successful)
+    updated_option = build_updated_option(option_entry, successful)
 
     if dry_run:
         preview = {lang: {k: v for k, v in trans.items() if k.startswith(("remarks_", "supplement_"))}
@@ -394,6 +398,38 @@ def sync_ticket_option(api, translator, store: StateStore,
     return {"status": "updated", "option_code": option_code, "languages_written": written_langs}
 
 
+# New: sync all options using pre‑fetched ticket data (avoids extra GET)
+def sync_all_options_for_ticket_from_data(
+    api,
+    translator,
+    store: StateStore,
+    supplier_id: str,
+    ticket_entry: Dict[str, Any],
+    target_languages: List[str],
+    dry_run: bool = True,
+    force: bool = False,
+) -> List[Dict[str, Any]]:
+    modality_codes = ticket_entry.get("modalityCodes", [])
+    if not modality_codes:
+        return [{"status": "skipped", "ticket_code": ticket_entry.get("code"), "reason": "no options"}]
+
+    ticket_code = ticket_entry.get("code")
+    results = []
+    for opt_code in modality_codes:
+        # Fetch each option individually (no way to batch)
+        option = api.get_ticket_option(supplier_id, ticket_code, opt_code)
+        if isinstance(option, dict) and "error" in option:
+            results.append({"status": "fetch_failed", "option_code": opt_code, "detail": option})
+            continue
+        result = sync_ticket_option_from_data(
+            api, translator, store, supplier_id, option, ticket_code, opt_code,
+            target_languages, dry_run=dry_run, force=force
+        )
+        results.append(result)
+    return results
+
+
+# Legacy wrapper for backward compatibility (uses extra GET)
 def sync_all_options_for_ticket(api, translator, store: StateStore,
                                 supplier_id: str, ticket_code: str,
                                 target_languages: List[str],
@@ -401,14 +437,10 @@ def sync_all_options_for_ticket(api, translator, store: StateStore,
     ticket = api.get_ticket(supplier_id, ticket_code)
     if isinstance(ticket, dict) and "error" in ticket:
         return [{"status": "fetch_ticket_failed", "ticket_code": ticket_code, "detail": ticket}]
-    modality_codes = ticket.get("modalityCodes", [])
-    if not modality_codes:
-        return [{"status": "skipped", "ticket_code": ticket_code, "reason": "no options"}]
-    results = []
-    for opt_code in modality_codes:
-        results.append(sync_ticket_option(api, translator, store, supplier_id, ticket_code, opt_code,
-                                          target_languages, dry_run=dry_run, force=force))
-    return results
+    return sync_all_options_for_ticket_from_data(
+        api, translator, store, supplier_id, ticket, target_languages,
+        dry_run=dry_run, force=force
+    )
 
 
 def fetch_all_tickets(api, supplier_id: str, limit: int = None, page_size: int = 100) -> List[Dict[str, Any]]:
