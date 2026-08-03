@@ -1,6 +1,16 @@
-import streamlit as st
-import hmac
+"""
+streamlit_app.py — with supplier dropdown, progress, support for Transfers, and password protection.
+"""
 
+import os
+import json
+import hmac
+import streamlit as st
+
+
+# ----------------------------------------------------------------------------
+# Password check (must run before any code that uses st.secrets or st.stop)
+# ----------------------------------------------------------------------------
 def check_password():
     """Returns `True` if the user had the correct password."""
 
@@ -24,12 +34,15 @@ def check_password():
         st.error("😕 Password incorrect")
     return False
 
+
+# --- Password gate ---
 if not check_password():
     st.stop()  # Do not continue if check_password is False.
 
-# --- Rest of your app's main code here ---
 
-
+# ----------------------------------------------------------------------------
+# Load secrets into environment (for downstream modules)
+# ----------------------------------------------------------------------------
 def _load_secrets_into_env():
     keys = [
         "TRAVELC_BASE_URL", "TRAVELC_MICROSITE_ID", "TRAVELC_USERNAME",
@@ -51,6 +64,9 @@ _load_secrets_into_env()
 from dotenv import load_dotenv
 load_dotenv()
 
+# ----------------------------------------------------------------------------
+# Imports (after password check and secrets loading)
+# ----------------------------------------------------------------------------
 from travelcompositor_api import TravelCompositorAPI
 from translator import get_translator, required_api_key_env_var
 from state_store import StateStore
@@ -74,6 +90,9 @@ from sync_transfer import (
     fetch_all_transfers,
 )
 
+# ----------------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------------
 DEFAULT_TARGET_LANGUAGES = [
     "FR", "SL", "PL", "DE", "SK", "AR", "HR", "HU", "AZ", "NL", "ES", "TR",
     "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS", "TH", "EL", "FI", "JA",
@@ -81,10 +100,14 @@ DEFAULT_TARGET_LANGUAGES = [
 ]
 TEST_LANGUAGES = ["FR", "DE"]
 
+# ----------------------------------------------------------------------------
+# Streamlit UI
+# ----------------------------------------------------------------------------
 st.set_page_config(page_title="Momira Travel — Translator", page_icon="🌐")
 st.title("🌐 Momira Travel — Translation Sync")
 st.caption("Translate Holiday Packages, Tickets, or Transfers (live mode).")
 
+# Check for required secrets (after password check)
 missing = [
     k for k in (required_api_key_env_var(), "TRAVELC_USERNAME", "TRAVELC_PASSWORD")
     if not os.getenv(k)
@@ -94,6 +117,9 @@ if missing:
     st.stop()
 
 
+# ----------------------------------------------------------------------------
+# Helper: fetch suppliers (cached)
+# ----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_suppliers():
     try:
@@ -108,6 +134,9 @@ def fetch_suppliers():
         return []
 
 
+# ----------------------------------------------------------------------------
+# Sidebar
+# ----------------------------------------------------------------------------
 with st.sidebar:
     st.header("Settings")
     entity_type = st.radio("What to translate?", ["Holiday Packages", "Tickets", "Transfers"])
@@ -173,6 +202,9 @@ with st.sidebar:
 
     force = st.checkbox("Force re-translate (ignore tracker)", value=False)
 
+# ----------------------------------------------------------------------------
+# Main area – display target languages and mode
+# ----------------------------------------------------------------------------
 st.write(f"**Target languages:** {', '.join(target_languages)}")
 st.warning("⚠️ Live mode – translations will be written to Travel Compositor immediately.")
 if force:
@@ -187,6 +219,10 @@ def log_message(msg):
     st.session_state.log_lines.append(msg)
     log_placeholder.text("\n".join(st.session_state.log_lines[-200:]))
 
+
+# ----------------------------------------------------------------------------
+# Main translate button
+# ----------------------------------------------------------------------------
 if st.button("🚀 Translate now", type="primary"):
     if entity_type != "Holiday Packages" and not supplier_id:
         st.error("Supplier ID is required.")
@@ -325,7 +361,9 @@ if st.button("🚀 Translate now", type="primary"):
                     log_message(f"   ✅ Finished transfer {transfer_id}")
                 progress_placeholder.empty()
 
+    # ------------------------------------------------------------------------
     # Show summary
+    # ------------------------------------------------------------------------
     by_status = {}
     def count(r):
         if isinstance(r, dict):
