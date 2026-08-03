@@ -1,5 +1,5 @@
 """
-streamlit_app.py — with supplier dropdown, progress, support for Transfers and Transports.
+streamlit_app.py — with supplier dropdown, progress, support for all services.
 """
 
 import os
@@ -57,10 +57,12 @@ from travelcompositor_api import TravelCompositorAPI
 from translator import get_translator, required_api_key_env_var
 from state_store import StateStore
 
-# Holiday package imports
+# ---- Imports for all services ----
+
+# Holiday packages
 from sync_holiday_package import sync_holiday_package, sync_all_holiday_packages
 
-# Ticket imports
+# Tickets
 from sync_ticket import (
     sync_ticket,
     sync_ticket_from_data,
@@ -68,7 +70,7 @@ from sync_ticket import (
     fetch_all_tickets,
 )
 
-# Transfer imports
+# Transfers
 from sync_transfer import (
     sync_transfer,
     sync_transfer_from_data,
@@ -76,13 +78,21 @@ from sync_transfer import (
     fetch_all_transfers,
 )
 
-# Transport imports
+# Transports
 from sync_transport import (
     sync_transport,
     sync_transport_from_data,
     sync_all_transports_for_supplier,
-    sync_all_options_for_transport_from_data,   # <-- ADDED
+    sync_all_options_for_transport_from_data,
     fetch_all_transports,
+)
+
+# Hotels
+from sync_hotel import (
+    sync_hotel,
+    sync_hotel_from_data,
+    sync_all_hotels_for_supplier,
+    fetch_all_hotels,
 )
 
 DEFAULT_TARGET_LANGUAGES = [
@@ -94,7 +104,7 @@ TEST_LANGUAGES = ["FR", "DE"]
 
 st.set_page_config(page_title="Momira Travel — Translator", page_icon="🌐")
 st.title("🌐 Momira Travel — Translation Sync")
-st.caption("Translate Holiday Packages, Tickets, Transfers, or Transports (live mode).")
+st.caption("Translate Holiday Packages, Tickets, Transfers, Transports, or Hotels (live mode).")
 
 missing = [
     k for k in (required_api_key_env_var(), "TRAVELC_USERNAME", "TRAVELC_PASSWORD")
@@ -121,8 +131,12 @@ def fetch_suppliers():
 
 with st.sidebar:
     st.header("Settings")
-    entity_type = st.radio("What to translate?", ["Holiday Packages", "Tickets", "Transfers", "Transports"])
+    entity_type = st.radio(
+        "What to translate?",
+        ["Holiday Packages", "Tickets", "Transfers", "Transports", "Hotels"]
+    )
 
+    # ---- Holiday Packages ----
     if entity_type == "Holiday Packages":
         microsite_id = st.text_input("Microsite ID", value=os.getenv("TRAVELC_MICROSITE_ID", "momiratravel"))
         scope = st.radio("Which packages?", ["All active packages", "One specific package ID"])
@@ -134,6 +148,7 @@ with st.sidebar:
             limit_input = st.number_input("Limit to first N packages (0 = no limit)", min_value=0, value=5)
             limit = limit_input or None
 
+    # ---- Tickets ----
     elif entity_type == "Tickets":
         suppliers = fetch_suppliers()
         if suppliers:
@@ -155,6 +170,7 @@ with st.sidebar:
             limit_input = st.number_input("Limit to first N tickets (0 = no limit)", min_value=0, value=5)
             limit = limit_input or None
 
+    # ---- Transfers ----
     elif entity_type == "Transfers":
         suppliers = fetch_suppliers()
         if suppliers:
@@ -176,7 +192,8 @@ with st.sidebar:
             limit_input = st.number_input("Limit to first N transfers (0 = no limit)", min_value=0, value=5)
             limit = limit_input or None
 
-    else:  # Transports
+    # ---- Transports ----
+    elif entity_type == "Transports":
         suppliers = fetch_suppliers()
         if suppliers:
             supplier_options = {name: id for id, name in suppliers}
@@ -197,6 +214,29 @@ with st.sidebar:
             limit_input = st.number_input("Limit to first N transports (0 = no limit)", min_value=0, value=5)
             limit = limit_input or None
 
+    # ---- Hotels ----
+    else:  # Hotels
+        suppliers = fetch_suppliers()
+        if suppliers:
+            supplier_options = {name: id for id, name in suppliers}
+            selected_name = st.selectbox("Select Supplier", options=list(supplier_options.keys()))
+            supplier_id = str(supplier_options[selected_name])
+            st.caption(f"Using supplier ID: {supplier_id}")
+        else:
+            supplier_id = st.text_input("Supplier ID (numeric)", value=os.getenv("TRAVELC_SUPPLIER_ID", ""))
+            if not supplier_id:
+                st.warning("Please enter a supplier ID.")
+
+        scope = st.radio("Which hotels?", ["All hotels", "One specific provider code"])
+        provider_code = None
+        if scope == "One specific provider code":
+            provider_code = st.text_input("Provider Code (e.g., CAI-H1)")
+        limit = None
+        if scope == "All hotels":
+            limit_input = st.number_input("Limit to first N hotels (0 = no limit)", min_value=0, value=5)
+            limit = limit_input or None
+
+    # ---- Common language settings ----
     lang_mode = st.radio(
         "Languages",
         ["Test set (FR, DE)", "All 30 target languages"],
@@ -205,6 +245,7 @@ with st.sidebar:
 
     force = st.checkbox("Force re-translate (ignore tracker)", value=False)
 
+# ---- Main area ----
 st.write(f"**Target languages:** {', '.join(target_languages)}")
 st.warning("⚠️ Live mode – translations will be written to Travel Compositor immediately.")
 if force:
@@ -232,6 +273,7 @@ if st.button("🚀 Translate now", type="primary"):
     store = StateStore()
 
     with st.spinner("Working..."):
+        # ---- Holiday Packages ----
         if entity_type == "Holiday Packages":
             if scope == "One specific package ID":
                 if not package_id:
@@ -248,6 +290,7 @@ if st.button("🚀 Translate now", type="primary"):
                     dry_run=False, limit=limit, force=force
                 )
 
+        # ---- Tickets ----
         elif entity_type == "Tickets":
             if scope == "One specific ticket code":
                 if not ticket_code:
@@ -314,6 +357,7 @@ if st.button("🚀 Translate now", type="primary"):
                     log_message(f"   ✅ Finished ticket {code}")
                 progress_placeholder.empty()
 
+        # ---- Transfers ----
         elif entity_type == "Transfers":
             if scope == "One specific transfer ID":
                 if not transfer_id:
@@ -354,7 +398,8 @@ if st.button("🚀 Translate now", type="primary"):
                     log_message(f"   ✅ Finished transfer {transfer_id}")
                 progress_placeholder.empty()
 
-        else:  # Transports
+        # ---- Transports ----
+        elif entity_type == "Transports":
             if scope == "One specific transport ID":
                 if not transport_id:
                     st.error("Enter a Transport ID first.")
@@ -418,15 +463,76 @@ if st.button("🚀 Translate now", type="primary"):
                     log_message(f"   ✅ Finished transport {transport_id}")
                 progress_placeholder.empty()
 
-    # Summary
+        # ---- Hotels ----
+        else:  # Hotels
+            if scope == "One specific provider code":
+                if not provider_code:
+                    st.error("Enter a Provider Code first.")
+                    st.stop()
+                log_message(f"📋 Fetching hotel {provider_code} for supplier {supplier_id}...")
+                hotel = api.get_hotel(supplier_id, provider_code)
+                if isinstance(hotel, dict) and "error" in hotel:
+                    results = [{"status": "fetch_failed", "provider_code": provider_code, "detail": hotel}]
+                else:
+                    result = sync_hotel(api, translator, store, supplier_id, hotel, target_languages,
+                                        dry_run=False, force=force)
+                    results = [result]
+            else:
+                log_message(f"📋 Fetching hotels for supplier {supplier_id}...")
+                hotels = fetch_all_hotels(api, supplier_id, limit=limit)
+                log_message(f"📋 Found {len(hotels)} hotel(s).")
+                results = []
+                progress_placeholder = st.empty()
+
+                for idx, h in enumerate(hotels):
+                    provider_code = h.get("providerCode")
+                    if not provider_code:
+                        log_message(f"⚠️ Skipping hotel {idx+1}: no providerCode")
+                        results.append({"status": "skipped", "reason": "no providerCode", "raw": h})
+                        continue
+
+                    progress_placeholder.write(f"🔄 Processing hotel {idx+1}/{len(hotels)}: **{provider_code}**")
+                    log_message(f"🔄 Processing hotel {idx+1}/{len(hotels)}: {provider_code}")
+
+                    # Get full hotel details
+                    full_hotel = api.get_hotel(supplier_id, provider_code)
+                    if isinstance(full_hotel, dict) and "error" in full_hotel:
+                        log_message(f"   ❌ Failed to fetch full details for {provider_code}")
+                        results.append({"status": "fetch_failed", "provider_code": provider_code, "detail": full_hotel})
+                        continue
+
+                    hotel_result = sync_hotel(api, translator, store, supplier_id, full_hotel,
+                                              target_languages, dry_run=False, force=force)
+
+                    # Log main status
+                    main_status = hotel_result.get("main", {}).get("status", "unknown")
+                    rooms_updated = sum(1 for r in hotel_result.get("rooms", []) if r.get("status") == "updated")
+                    supps_updated = sum(1 for s in hotel_result.get("supplements", []) if s.get("status") == "updated")
+                    log_message(f"   Main: {main_status}, Rooms updated: {rooms_updated}, Supplements updated: {supps_updated}")
+                    results.append(hotel_result)
+                    log_message(f"   ✅ Finished hotel {provider_code}")
+                progress_placeholder.empty()
+
+    # ---- Summary ----
     by_status = {}
     def count(r):
         if isinstance(r, dict):
-            status = r.get("status", "unknown")
-            by_status.setdefault(status, []).append(r)
-            if "options" in r and isinstance(r["options"], list):
-                for opt in r["options"]:
-                    count(opt)
+            # If it's a hotel result, it has 'main', 'rooms', 'supplements'
+            if "main" in r:
+                main = r["main"]
+                if isinstance(main, dict):
+                    status = main.get("status", "unknown")
+                    by_status.setdefault(status, []).append(main)
+                for room in r.get("rooms", []):
+                    count(room)
+                for supp in r.get("supplements", []):
+                    count(supp)
+            else:
+                status = r.get("status", "unknown")
+                by_status.setdefault(status, []).append(r)
+                if "options" in r and isinstance(r["options"], list):
+                    for opt in r["options"]:
+                        count(opt)
         else:
             by_status.setdefault("unknown", []).append(r)
     for r in results:
