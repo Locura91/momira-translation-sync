@@ -1,6 +1,5 @@
 """
-streamlit_app.py — the "Translate now" button, now for Holiday Packages AND Tickets.
-With supplier dropdown, progress display, and optimized ticket sync.
+streamlit_app.py — with supplier dropdown and progress for "All tickets".
 """
 
 import os
@@ -64,6 +63,7 @@ if missing:
     st.error(f"Missing required secret(s): {', '.join(missing)}. Add them in Streamlit Cloud Secrets or local .env.")
     st.stop()
 
+
 # ----- Helper to fetch suppliers (cached) -----
 @st.cache_data(ttl=300)  # cache for 5 minutes
 def fetch_suppliers():
@@ -73,7 +73,6 @@ def fetch_suppliers():
         suppliers = api.get_all_suppliers()
         if not suppliers:
             return []
-        # Sort by commercialName
         suppliers_sorted = sorted(suppliers, key=lambda s: s.get('commercialName', '').lower())
         return [(s['id'], s.get('commercialName', f"Supplier {s['id']}")) for s in suppliers_sorted]
     except Exception as e:
@@ -100,13 +99,11 @@ with st.sidebar:
         # ---- Supplier selection ----
         suppliers = fetch_suppliers()
         if suppliers:
-            # Use selectbox
             supplier_options = {name: id for id, name in suppliers}
             selected_name = st.selectbox("Select Supplier", options=list(supplier_options.keys()))
             supplier_id = str(supplier_options[selected_name])
             st.caption(f"Using supplier ID: {supplier_id}")
         else:
-            # Fallback to manual entry
             supplier_id = st.text_input("Supplier ID (numeric)", value=os.getenv("TRAVELC_SUPPLIER_ID", ""))
             if not supplier_id:
                 st.warning("Please enter a supplier ID.")
@@ -138,7 +135,6 @@ if force:
     st.warning("🔁 Force re-translate is ON — ignores the tracker.")
 
 if st.button("🚀 Translate now", type="primary"):
-    # Validate
     if entity_type == "Tickets" and not supplier_id:
         st.error("Supplier ID is required.")
         st.stop()
@@ -181,7 +177,7 @@ if st.button("🚀 Translate now", type="primary"):
                     main_result["options"] = option_results
                 results = [main_result] if isinstance(main_result, dict) else [main_result] + option_results
             else:
-                # All tickets – with progress display
+                # ---- All tickets ----
                 st.info(f"📋 Fetching tickets for supplier {supplier_id}...")
                 tickets = fetch_all_tickets(api, supplier_id, limit=limit)
                 st.info(f"📋 Found {len(tickets)} ticket(s).")
@@ -197,18 +193,19 @@ if st.button("🚀 Translate now", type="primary"):
 
                     progress_placeholder.write(f"🔄 Processing ticket {idx+1}/{len(tickets)}: **{code}**")
 
-                    # Use sync_ticket_from_data to avoid extra GET
+                    # --- Main ticket (using pre-fetched data) ---
                     main_result = sync_ticket_from_data(
                         api, translator, store, supplier_id, t, target_languages,
                         dry_run=dry_run, force=force
                     )
+                    # Show friendly message
                     if main_result.get("status") == "up_to_date":
                         st.write(f"   ✅ Skipped – already translated.")
                     else:
                         st.write(f"   → Syncing main ticket...")
                     results.append(main_result)
 
-                    # Sync options
+                    # --- Options ---
                     st.write(f"   → Syncing options for {code}...")
                     option_results = sync_all_options_for_ticket(
                         api, translator, store, supplier_id, code, target_languages,
