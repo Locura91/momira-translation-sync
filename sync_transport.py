@@ -1,6 +1,5 @@
 """
-sync_transport.py — Sync transports (main + options) with translations.
-Fixed: baggageAllowance default to 1, and import for options.
+sync_transport.py — Sync transports (main + options) with self‑healing verification.
 """
 
 import json
@@ -185,6 +184,28 @@ def sync_transport_from_data(
             store, "transport", supplier_id, transport_id, source_hash,
             target_languages, transport_entry, translatable
         )
+
+    # --- Self‑healing: if state says all done, verify a sample language ---
+    if not needed:
+        sample_lang = "FR" if "FR" in target_languages else target_languages[0] if target_languages else "EN"
+        existing = get_existing_content_for_language(transport_entry, sample_lang)
+        if existing:
+            is_identical = True
+            for field, src_text in translatable.items():
+                if existing.get(field) != src_text:
+                    is_identical = False
+                    break
+            if is_identical:
+                print(f"🔍 Verification: {sample_lang} content is identical to source or missing. Forcing re-translation for all languages.")
+                needed = list(target_languages)
+            else:
+                # Content differs – it's actually translated, so up_to_date
+                verify_time = time.time() - t0
+                return {"status": "up_to_date", "transport_id": transport_id}
+        else:
+            print(f"🔍 Verification: {sample_lang} has no content. Forcing re-translation for all languages.")
+            needed = list(target_languages)
+
     verify_time = time.time() - t0
 
     if not needed:
@@ -275,7 +296,7 @@ def sync_transport(api, translator, store: StateStore,
     return main_result
 
 
-# ---- Option functions ----
+# ---- Option functions (unchanged) ----
 def extract_translatable_fields_from_transport_option(option_entry: Dict[str, Any]) -> Dict[str, str]:
     fields = {}
     # Try translations
