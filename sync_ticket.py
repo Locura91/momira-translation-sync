@@ -1,5 +1,5 @@
 """
-sync_ticket.py — Simplified single-pass sync for tickets (Claude friendly).
+sync_ticket.py — Simplified single-pass sync with pre‑check for existing translations.
 """
 
 import json
@@ -67,6 +67,88 @@ def build_updated_datasheets(original_datasheets: Dict[str, Any],
     return new_datasheets
 
 
+def get_existing_content_for_language(ticket: Dict[str, Any], lang: str) -> Dict[str, str]:
+    """Extract the current content for a given language (as a flat dict of strings)."""
+    datasheets = ticket.get("datasheets", {})
+    lang_entry = datasheets.get(lang, {})
+    if not lang_entry:
+        return {}
+    fields = {}
+    for f in TEXT_FIELDS:
+        val = lang_entry.get(f)
+        if isinstance(val, str) and val.strip():
+            fields[f] = val
+    for f in LIST_FIELDS:
+        val = lang_entry.get(f)
+        if isinstance(val, list) and val:
+            fields[f] = "\n".join(val)
+    return fields
+
+
+def verify_and_filter_needed(
+    store: StateStore,
+    entity_type: str,
+    supplier_id: str,
+    entity_id: str,
+    source_hash: str,
+    target_languages: List[str],
+    current_ticket: Dict[str, Any],
+    source_fields: Dict[str, str],
+    option_code: str = "",
+) -> List[str]:
+    """
+    Check the state first. For languages marked done, verify they are actually
+    translated (content differs from English). If they are already correct,
+    keep them in state. If they are still English, add them back to needed.
+    Also, if a language is not in state but its content is non‑English, we add
+    it to state and skip it.
+    """
+    # Get current state
+    state = store.get_state(entity_type, supplier_id, entity_id, option_code)
+    if state is None or state["source_hash"] != source_hash:
+        # State missing or source changed – we need all languages (will verify later)
+        needed = list(target_languages)
+    else:
+        already_done = set(state["translated_languages"])
+        needed = [lang for lang in target_languages if lang not in already_done]
+
+    # Now verify each language in `needed` by checking its existing content
+    truly_needed = []
+    languages_to_add_to_state = []
+
+    for lang in needed:
+        existing = get_existing_content_for_language(current_ticket, lang)
+        if not existing:
+            # Language entry missing – definitely need translation
+            truly_needed.append(lang)
+            continue
+
+        # Check if any field differs from source
+        is_identical = True
+        for field, src_text in source_fields.items():
+            if existing.get(field) != src_text:
+                is_identical = False
+                break
+
+        if is_identical:
+            # Content is still English – need translation
+            truly_needed.append(lang)
+        else:
+            # Content already differs – it's correctly translated
+            print(f"✅ {lang} already translated (content differs from source). Updating state.")
+            languages_to_add_to_state.append(lang)
+
+    # If any languages were found to be already translated, update the state
+    if languages_to_add_to_state:
+        # Merge with existing state
+        prior_state = store.get_state(entity_type, supplier_id, entity_id, option_code)
+        prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
+        all_langs = sorted(set(prior_langs) | set(languages_to_add_to_state))
+        store.upsert_state(entity_type, supplier_id, entity_id, source_hash, all_langs, option_code=option_code)
+
+    return truly_needed
+
+
 def sync_ticket(api, translator, store: StateStore,
                 supplier_id: str, ticket_code: str,
                 target_languages: List[str],
@@ -87,7 +169,11 @@ def sync_ticket(api, translator, store: StateStore,
     if force:
         needed = list(target_languages)
     else:
-        needed = store.languages_needed("ticket", supplier_id, ticket_code, source_hash, target_languages)
+        # Use verification to filter out already-translated languages
+        needed = verify_and_filter_needed(
+            store, "ticket", supplier_id, ticket_code, source_hash,
+            target_languages, ticket, translatable
+        )
 
     if not needed:
         return {"status": "up_to_date", "ticket_code": ticket_code}
@@ -141,7 +227,26 @@ def sync_ticket(api, translator, store: StateStore,
     return {"status": "updated", "ticket_code": ticket_code, "languages_written": written_langs}
 
 
-# ---- Option functions (same simplification) ----
+# ---- Option functions (with similar verification) ----
+def get_existing_option_content(option_entry: Dict[str, Any], lang: str) -> Dict[str, str]:
+    fields = {}
+    remarks = option_entry.get("remarks", {})
+    lang_remarks = remarks.get(lang, {})
+    if isinstance(lang_remarks, dict):
+        if lang_remarks.get("name"):
+            fields["remarks_name"] = lang_remarks["name"]
+        if lang_remarks.get("remarks"):
+            fields["remarks_remarks"] = lang_remarks["remarks"]
+
+    supplements = option_entry.get("supplements", [])
+    for idx, supp in enumerate(supplements):
+        trans = supp.get("translations", {})
+        lang_supp = trans.get(lang, {})
+        if isinstance(lang_supp, dict) and lang_supp.get("name"):
+            fields[f"supplement_{idx}_name"] = lang_supp["name"]
+    return fields
+
+
 def extract_translatable_fields_from_option(option_entry: Dict[str, Any]) -> Dict[str, str]:
     fields = {}
     remarks = option_entry.get("remarks", {})
@@ -211,8 +316,11 @@ def sync_ticket_option(api, translator, store: StateStore,
     if force:
         needed = list(target_languages)
     else:
-        needed = store.languages_needed("ticket_option", supplier_id, entity_id,
-                                        source_hash, target_languages, option_code=option_code)
+        needed = verify_and_filter_needed(
+            store, "ticket_option", supplier_id, entity_id, source_hash,
+            target_languages, option, translatable, option_code=option_code
+        )
+
     if not needed:
         return {"status": "up_to_date", "option_code": option_code}
 
