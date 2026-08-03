@@ -1,35 +1,11 @@
 """
 streamlit_app.py — with supplier dropdown, progress, support for all services.
+No password protection (can be added later).
 """
 
 import os
 import json
-import hmac
 import streamlit as st
-
-
-def check_password():
-    """Returns `True` if the user had the correct password."""
-    def password_entered():
-        if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
-
-    if st.session_state.get("password_correct", False):
-        return True
-
-    st.text_input(
-        "Password", type="password", on_change=password_entered, key="password"
-    )
-    if "password_correct" in st.session_state:
-        st.error("😕 Password incorrect")
-    return False
-
-
-if not check_password():
-    st.stop()
 
 
 def _load_secrets_into_env():
@@ -89,9 +65,9 @@ from sync_transport import (
 
 # Hotels
 from sync_hotel import (
-    sync_hotel,                         # for single hotel
-    sync_all_hotels_for_supplier,       # for all hotels
-    fetch_all_hotels,                   # to fetch list
+    sync_hotel,
+    sync_all_hotels_for_supplier,
+    fetch_all_hotels,
 )
 
 DEFAULT_TARGET_LANGUAGES = [
