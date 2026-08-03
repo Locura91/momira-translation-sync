@@ -1,11 +1,12 @@
 """
-sync_ticket.py — with timing logs to diagnose slowdowns.
+sync_ticket.py — Optimized with concurrent option fetching.
 """
 
 import json
 import re
 import time
 from typing import Dict, Any, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from state_store import StateStore, compute_hash
 from translator import get_translator
@@ -13,7 +14,7 @@ from translator import get_translator
 # ---- Configuration ----
 BATCH_SIZE = 10
 DELAY_BETWEEN_BATCHES = 2
-MAX_RETRIES_PER_BATCH = 3  # within translator
+MAX_OPTION_WORKERS = 5   # number of parallel option fetches
 
 # ---- Main ticket fields ----
 TEXT_FIELDS = ("name", "description", "meetingPoint", "activityType",
@@ -161,7 +162,6 @@ def sync_ticket_from_data(
     target_languages: List[str],
     dry_run: bool = True,
     force: bool = False,
-    progress_callback=None,
 ) -> Dict[str, Any]:
     start_time = time.time()
     ticket_code = ticket_entry.get("code")
@@ -192,21 +192,15 @@ def sync_ticket_from_data(
 
     compressed_translatable = compress_translatable_fields(translatable)
 
-    print(f"🌐 Translating ticket {ticket_code}: {len(needed)} languages")
     combined_translations = {}
     total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
     translation_start = time.time()
     for i in range(0, len(needed), BATCH_SIZE):
         batch = needed[i:i+BATCH_SIZE]
         batch_num = i//BATCH_SIZE + 1
-        batch_start = time.time()
         print(f"   batch {batch_num}/{total_batches}: {batch}")
-        if progress_callback:
-            progress_callback(f"   Batch {batch_num}/{total_batches}: translating {len(batch)} languages")
         batch_result = translator.translate_fields(compressed_translatable, batch)
         combined_translations.update(batch_result)
-        batch_time = time.time() - batch_start
-        print(f"      Batch took {batch_time:.1f}s")
         if i + BATCH_SIZE < len(needed):
             time.sleep(DELAY_BETWEEN_BATCHES)
     translation_time = time.time() - translation_start
@@ -235,7 +229,6 @@ def sync_ticket_from_data(
         return {"status": "dry_run_preview", "ticket_code": ticket_code,
                 "languages": list(successful.keys()), "preview": preview}
 
-    # Write
     write_start = time.time()
     payload = dict(ticket_entry)
     payload["datasheets"] = new_datasheets
@@ -251,11 +244,12 @@ def sync_ticket_from_data(
     store.upsert_state("ticket", supplier_id, ticket_code, source_hash, all_langs)
 
     total_time = time.time() - start_time
-    print(f"✅ Ticket {ticket_code} done in {total_time:.1f}s (verify: {verify_time:.1f}s, translate: {translation_time:.1f}s, write: {write_time:.1f}s)")
+    print(f"✅ Ticket {ticket_code} done in {total_time:.1f}s "
+          f"(verify: {verify_time:.1f}s, translate: {translation_time:.1f}s, write: {write_time:.1f}s)")
     return {"status": "updated", "ticket_code": ticket_code, "languages_written": written_langs}
 
 
-# Original sync_ticket wrapper
+# Original sync_ticket wrapper (for single ticket mode)
 def sync_ticket(api, translator, store: StateStore,
                 supplier_id: str, ticket_code: str,
                 target_languages: List[str],
@@ -267,7 +261,7 @@ def sync_ticket(api, translator, store: StateStore,
                                  target_languages, dry_run=dry_run, force=force)
 
 
-# ---- Option functions (with timing) ----
+# ---- Option functions (with concurrent fetching) ----
 def get_existing_option_content(option_entry: Dict[str, Any], lang: str) -> Dict[str, str]:
     fields = {}
     remarks = option_entry.get("remarks", {})
@@ -371,7 +365,6 @@ def sync_ticket_option_from_data(
 
     compressed_translatable = compress_translatable_fields(translatable)
 
-    print(f"🌐 Translating option {option_code}: {len(needed)} languages")
     combined_translations = {}
     total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
     for i in range(0, len(needed), BATCH_SIZE):
@@ -436,11 +429,33 @@ def sync_all_options_for_ticket_from_data(
         return [{"status": "skipped", "ticket_code": ticket_entry.get("code"), "reason": "no options"}]
 
     ticket_code = ticket_entry.get("code")
+    # ---- Fetch options concurrently ----
+    option_entries = {}
+    with ThreadPoolExecutor(max_workers=MAX_OPTION_WORKERS) as executor:
+        future_to_code = {
+            executor.submit(api.get_ticket_option, supplier_id, ticket_code, opt_code): opt_code
+            for opt_code in modality_codes
+        }
+        for future in as_completed(future_to_code):
+            opt_code = future_to_code[future]
+            try:
+                option = future.result()
+                if isinstance(option, dict) and "error" in option:
+                    option_entries[opt_code] = {"error": option}
+                else:
+                    option_entries[opt_code] = option
+            except Exception as e:
+                option_entries[opt_code] = {"error": str(e)}
+
+    # ---- Process options sequentially (translation/writing) ----
     results = []
     for opt_code in modality_codes:
-        option = api.get_ticket_option(supplier_id, ticket_code, opt_code)
+        option = option_entries.get(opt_code)
+        if option is None:
+            results.append({"status": "fetch_failed", "option_code": opt_code, "detail": "No response"})
+            continue
         if isinstance(option, dict) and "error" in option:
-            results.append({"status": "fetch_failed", "option_code": opt_code, "detail": option})
+            results.append({"status": "fetch_failed", "option_code": opt_code, "detail": option["error"]})
             continue
         result = sync_ticket_option_from_data(
             api, translator, store, supplier_id, option, ticket_code, opt_code,
@@ -450,7 +465,7 @@ def sync_all_options_for_ticket_from_data(
     return results
 
 
-# Legacy wrapper (uses extra GET) – kept for single ticket mode
+# Legacy wrapper (uses extra GET) – kept for backward compatibility
 def sync_all_options_for_ticket(api, translator, store: StateStore,
                                 supplier_id: str, ticket_code: str,
                                 target_languages: List[str],
