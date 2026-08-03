@@ -1,9 +1,11 @@
 """
-streamlit_app.py — with supplier dropdown, progress, and live mode only.
+streamlit_app.py — with timing logs in the UI.
 """
 
 import os
 import json
+import sys
+from io import StringIO
 
 import streamlit as st
 
@@ -127,10 +129,25 @@ st.warning("⚠️ Live mode – translations will be written to Travel Composit
 if force:
     st.warning("🔁 Force re-translate is ON – ignores the tracker.")
 
+# We'll use a placeholder to show live logs
+log_placeholder = st.empty()
+
+def log_message(msg):
+    # Append to a persistent list
+    if 'log_lines' not in st.session_state:
+        st.session_state.log_lines = []
+    st.session_state.log_lines.append(msg)
+    # Display the last 200 lines
+    log_placeholder.text("\n".join(st.session_state.log_lines[-200:]))
+
 if st.button("🚀 Translate now", type="primary"):
     if entity_type == "Tickets" and not supplier_id:
         st.error("Supplier ID is required.")
         st.stop()
+
+    # Clear logs
+    st.session_state.log_lines = []
+    log_placeholder.empty()
 
     api = TravelCompositorAPI()
     translator = get_translator()
@@ -171,20 +188,21 @@ if st.button("🚀 Translate now", type="primary"):
                 results = [main_result] if isinstance(main_result, dict) else [main_result] + option_results
             else:
                 # ---- All tickets ----
-                st.info(f"📋 Fetching tickets for supplier {supplier_id}...")
+                log_message(f"📋 Fetching tickets for supplier {supplier_id}...")
                 tickets = fetch_all_tickets(api, supplier_id, limit=limit)
-                st.info(f"📋 Found {len(tickets)} ticket(s).")
+                log_message(f"📋 Found {len(tickets)} ticket(s).")
                 results = []
                 progress_placeholder = st.empty()
 
                 for idx, t in enumerate(tickets):
                     code = t.get("code")
                     if not code:
-                        st.warning(f"⚠️ Skipping ticket {idx+1}: no code field")
+                        log_message(f"⚠️ Skipping ticket {idx+1}: no code field")
                         results.append({"status": "skipped", "reason": "no code field", "raw": t})
                         continue
 
                     progress_placeholder.write(f"🔄 Processing ticket {idx+1}/{len(tickets)}: **{code}**")
+                    log_message(f"🔄 Processing ticket {idx+1}/{len(tickets)}: {code}")
 
                     # --- Main ticket (using pre-fetched data) ---
                     main_result = sync_ticket_from_data(
@@ -192,13 +210,13 @@ if st.button("🚀 Translate now", type="primary"):
                         dry_run=False, force=force
                     )
                     if main_result.get("status") == "up_to_date":
-                        st.write(f"   ✅ Skipped – already translated.")
+                        log_message(f"   ✅ Skipped – already translated.")
                     else:
-                        st.write(f"   → Syncing main ticket...")
+                        log_message(f"   → Syncing main ticket...")
                     results.append(main_result)
 
                     # --- Options ---
-                    st.write(f"   → Syncing options...")
+                    log_message(f"   → Syncing options...")
                     option_results = sync_all_options_for_ticket_from_data(
                         api, translator, store, supplier_id, t, target_languages,
                         dry_run=False, force=force
@@ -213,14 +231,13 @@ if st.button("🚀 Translate now", type="primary"):
                         up_to_date = sum(1 for r in option_results if r.get('status') == 'up_to_date')
                         updated = sum(1 for r in option_results if r.get('status') == 'updated')
                         skipped = sum(1 for r in option_results if r.get('status') == 'skipped')
-                        st.write(f"      Options: {len(option_results)} total, {up_to_date} up-to-date, {updated} updated, {skipped} skipped")
+                        log_message(f"      Options: {len(option_results)} total, {up_to_date} up-to-date, {updated} updated, {skipped} skipped")
                         for opt_res in option_results:
                             opt_code = opt_res.get('option_code', '?')
                             status = opt_res.get('status', 'unknown')
-                            st.write(f"         - {opt_code}: {status}")
+                            log_message(f"         - {opt_code}: {status}")
 
-                    st.write(f"   ✅ Finished ticket {code}")
-                    st.divider()
+                    log_message(f"   ✅ Finished ticket {code}")
 
                 progress_placeholder.empty()
 
