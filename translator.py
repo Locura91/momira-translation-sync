@@ -257,7 +257,7 @@ class GeminiTranslator:
                         "thinking_config": {"thinking_budget": 0},
                         # Generous cap so a full 30-language batch (the real
                         # production run) can't get silently truncated mid-JSON.
-                        "max_output_tokens": 32768,
+                        "max_output_tokens": 65536,
                     },
                 )
                 parsed = json.loads(response.text)
