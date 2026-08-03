@@ -1,6 +1,6 @@
 """
 sync_transport.py — Sync transports (main + options) with translations.
-Fixed: baggageAllowance default to 1 if missing or not a number.
+Fixed: baggageAllowance default to 1, and import for options.
 """
 
 import json
@@ -409,7 +409,7 @@ def sync_transport_option_from_data(
 
     updated_option = build_updated_option(option_entry, successful)
 
-    # Ensure baggageAllowance is a number (set to 1 if missing or not a number)
+    # Ensure baggageAllowance is a number (default to 1)
     if "baggageAllowance" not in updated_option or not isinstance(updated_option.get("baggageAllowance"), (int, float)):
         updated_option["baggageAllowance"] = 1
 
