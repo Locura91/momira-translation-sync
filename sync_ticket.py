@@ -1,6 +1,5 @@
 """
 sync_ticket.py — Sync tickets (main + options) with batching, verification, and retries.
-Batch size reduced to 3 for long descriptions.
 """
 
 import json
@@ -11,10 +10,10 @@ from state_store import StateStore, compute_hash
 from translator import get_translator
 
 # ---- Configuration ----
-BATCH_SIZE = 5          # Languages per translation API call (reduced from 5)
-MAX_ATTEMPTS = 5        # Max retry attempts per ticket/option
-DELAY_BETWEEN_BATCHES = 15   # seconds
-DELAY_BETWEEN_ATTEMPTS = 5.0  # seconds
+BATCH_SIZE = 5               # Languages per translation API call
+MAX_ATTEMPTS = 5             # Max retry attempts per ticket/option
+DELAY_BETWEEN_BATCHES = 15   # Seconds to wait between batch API calls (to stay under 5 RPM)
+DELAY_BETWEEN_ATTEMPTS = 5.0 # Seconds to wait after a failed attempt
 
 # ---- Main ticket fields ----
 TEXT_FIELDS = ("name", "description", "meetingPoint", "activityType",
@@ -164,11 +163,8 @@ def sync_ticket(api, translator, store: StateStore,
     source_hash = compute_hash(translatable)
     en_entry = datasheets.get("EN") or datasheets.get("EN_US") or {}
 
-    # Retry loop
     attempt = 0
-    all_translations = {}   # accumulate successful translations across attempts
-    last_missing = list(target_languages)  # start with all languages
-    
+    all_translations = {}
     while attempt < MAX_ATTEMPTS:
         attempt += 1
         if force:
@@ -182,34 +178,26 @@ def sync_ticket(api, translator, store: StateStore,
             break
 
         print(f"🔄 Attempt {attempt}/{MAX_ATTEMPTS}: translating {len(needed)} languages for ticket {ticket_code}")
-        print(f"   Missing: {needed}")
 
         combined = {}
-        # Translate in batches
-for i in range(0, len(needed), BATCH_SIZE):
-    batch = needed[i:i+BATCH_SIZE]
-    print(f"🌐 Translating ... (batch {i//BATCH_SIZE + 1})")
-    batch_result = translator.translate_fields(translatable, batch)
-    combined_translations.update(batch_result)
-    # Wait between batches, but not after the last one
-    if i + BATCH_SIZE < len(needed):
-        print(f"⏳ Waiting {DELAY_BETWEEN_BATCHES}s to respect rate limits...")
-        time.sleep(DELAY_BETWEEN_BATCHES)
-          
-        # Filter only successful translations (changed from source)
-        successful = filter_successful_translations(combined, translatable)
-        print(f"   Successful translations in this attempt: {list(successful.keys())}")
+        for i in range(0, len(needed), BATCH_SIZE):
+            batch = needed[i:i+BATCH_SIZE]
+            print(f"🌐 Translating ticket {ticket_code} (batch {i//BATCH_SIZE + 1}): {batch}")
+            batch_result = translator.translate_fields(translatable, batch)
+            combined.update(batch_result)
+            # Wait between batches, but not after the last one
+            if i + BATCH_SIZE < len(needed):
+                print(f"⏳ Waiting {DELAY_BETWEEN_BATCHES}s to respect rate limits...")
+                time.sleep(DELAY_BETWEEN_BATCHES)
 
+        successful = filter_successful_translations(combined, translatable)
         if not successful:
             print(f"⚠️  No successful translations in attempt {attempt}")
-            if attempt < MAX_ATTEMPTS:
-                print(f"   Waiting {DELAY_BETWEEN_ATTEMPTS}s before retry...")
-                time.sleep(DELAY_BETWEEN_ATTEMPTS)
+            time.sleep(DELAY_BETWEEN_ATTEMPTS)
             continue
 
         all_translations.update(successful)
 
-        # Build and write the updated datasheets
         if not dry_run:
             new_datasheets = build_updated_datasheets(datasheets, successful, en_entry)
             payload = dict(ticket)
@@ -217,26 +205,24 @@ for i in range(0, len(needed), BATCH_SIZE):
             result = api.update_ticket(supplier_id, payload)
             if isinstance(result, dict) and "error" in result:
                 print(f"❌ PUT failed for ticket {ticket_code}: {result}")
-                break  # Stop retrying if write fails
+                break
 
-            # Update state with the newly written languages
-            written_langs = list(successful.keys())
-            if written_langs:
-                prior_state = store.get_state("ticket", supplier_id, ticket_code)
-                prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
-                all_langs = sorted(set(prior_langs) | set(written_langs))
-                store.upsert_state("ticket", supplier_id, ticket_code, source_hash, all_langs)
+        written_langs = list(successful.keys())
+        if not dry_run and written_langs:
+            prior_state = store.get_state("ticket", supplier_id, ticket_code)
+            prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
+            all_langs = sorted(set(prior_langs) | set(written_langs))
+            store.upsert_state("ticket", supplier_id, ticket_code, source_hash, all_langs)
 
-            # Re‑fetch the ticket to get the latest content for verification
+        if not dry_run:
             ticket = api.get_ticket(supplier_id, ticket_code)
             if isinstance(ticket, dict) and "error" in ticket:
                 print(f"⚠️  Could not re‑fetch ticket {ticket_code} for verification")
                 break
-        else:
-            # In dry-run, we only do one attempt (no need to loop)
+
+        if dry_run:
             break
 
-    # Final result
     if dry_run:
         return {
             "status": "dry_run_preview",
@@ -246,7 +232,6 @@ for i in range(0, len(needed), BATCH_SIZE):
                         for lang, trans in all_translations.items()}
         }
 
-    # After all attempts, check what's still missing
     final_needed = languages_needed_with_verification(
         store, "ticket", supplier_id, ticket_code, source_hash,
         target_languages, ticket, translatable
@@ -266,7 +251,7 @@ for i in range(0, len(needed), BATCH_SIZE):
         }
 
 
-# ---- Option functions (with retries and smaller batch) ----
+# ---- Option functions (with retries) ----
 def extract_translatable_fields_from_option(option_entry: Dict[str, Any]) -> Dict[str, str]:
     fields = {}
     remarks = option_entry.get("remarks", {})
@@ -370,22 +355,21 @@ def sync_ticket_option(api, translator, store: StateStore,
             break
 
         print(f"🔄 Attempt {attempt}/{MAX_ATTEMPTS}: translating {len(needed)} languages for option {option_code}")
-        print(f"   Missing: {needed}")
+
         combined = {}
         for i in range(0, len(needed), BATCH_SIZE):
             batch = needed[i:i+BATCH_SIZE]
             print(f"🌐 Translating option {option_code} (batch {i//BATCH_SIZE + 1}): {batch}")
             batch_result = translator.translate_fields(translatable, batch)
             combined.update(batch_result)
-            time.sleep(DELAY_BETWEEN_BATCHES)
+            if i + BATCH_SIZE < len(needed):
+                print(f"⏳ Waiting {DELAY_BETWEEN_BATCHES}s to respect rate limits...")
+                time.sleep(DELAY_BETWEEN_BATCHES)
 
         successful = filter_successful_translations(combined, translatable)
-        print(f"   Successful translations in this attempt: {list(successful.keys())}")
         if not successful:
             print(f"⚠️  No successful translations in attempt {attempt}")
-            if attempt < MAX_ATTEMPTS:
-                print(f"   Waiting {DELAY_BETWEEN_ATTEMPTS}s before retry...")
-                time.sleep(DELAY_BETWEEN_ATTEMPTS)
+            time.sleep(DELAY_BETWEEN_ATTEMPTS)
             continue
 
         all_translations.update(successful)
@@ -397,19 +381,20 @@ def sync_ticket_option(api, translator, store: StateStore,
                 print(f"❌ PUT failed for option {option_code}: {result}")
                 break
 
-            written_langs = list(successful.keys())
-            if written_langs:
-                prior_state = store.get_state("ticket_option", supplier_id, entity_id, option_code=option_code)
-                prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
-                all_langs = sorted(set(prior_langs) | set(written_langs))
-                store.upsert_state("ticket_option", supplier_id, entity_id, source_hash, all_langs, option_code=option_code)
+        written_langs = list(successful.keys())
+        if not dry_run and written_langs:
+            prior_state = store.get_state("ticket_option", supplier_id, entity_id, option_code=option_code)
+            prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
+            all_langs = sorted(set(prior_langs) | set(written_langs))
+            store.upsert_state("ticket_option", supplier_id, entity_id, source_hash, all_langs, option_code=option_code)
 
-            # Re‑fetch option for verification
+        if not dry_run:
             option = api.get_ticket_option(supplier_id, ticket_code, option_code)
             if isinstance(option, dict) and "error" in option:
                 print(f"⚠️  Could not re‑fetch option {option_code} for verification")
                 break
-        else:
+
+        if dry_run:
             break
 
     if dry_run:
