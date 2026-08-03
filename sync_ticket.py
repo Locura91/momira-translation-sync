@@ -1,11 +1,11 @@
 """
-sync_ticket.py — Optimized with progress for options and no extra GET.
+sync_ticket.py — with timing logs to diagnose slowdowns.
 """
 
 import json
 import re
 import time
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional
 
 from state_store import StateStore, compute_hash
 from translator import get_translator
@@ -13,6 +13,7 @@ from translator import get_translator
 # ---- Configuration ----
 BATCH_SIZE = 10
 DELAY_BETWEEN_BATCHES = 2
+MAX_RETRIES_PER_BATCH = 3  # within translator
 
 # ---- Main ticket fields ----
 TEXT_FIELDS = ("name", "description", "meetingPoint", "activityType",
@@ -160,7 +161,9 @@ def sync_ticket_from_data(
     target_languages: List[str],
     dry_run: bool = True,
     force: bool = False,
+    progress_callback=None,
 ) -> Dict[str, Any]:
+    start_time = time.time()
     ticket_code = ticket_entry.get("code")
     if not ticket_code:
         return {"status": "skipped", "reason": "no code field"}
@@ -174,6 +177,7 @@ def sync_ticket_from_data(
         return {"status": "skipped", "ticket_code": ticket_code, "reason": "no translatable fields"}
 
     source_hash = compute_hash(translatable)
+    t0 = time.time()
     if force:
         needed = list(target_languages)
     else:
@@ -181,6 +185,7 @@ def sync_ticket_from_data(
             store, "ticket", supplier_id, ticket_code, source_hash,
             target_languages, ticket_entry, translatable
         )
+    verify_time = time.time() - t0
 
     if not needed:
         return {"status": "up_to_date", "ticket_code": ticket_code}
@@ -189,13 +194,22 @@ def sync_ticket_from_data(
 
     print(f"🌐 Translating ticket {ticket_code}: {len(needed)} languages")
     combined_translations = {}
+    total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
+    translation_start = time.time()
     for i in range(0, len(needed), BATCH_SIZE):
         batch = needed[i:i+BATCH_SIZE]
-        print(f"   batch {i//BATCH_SIZE+1}: {batch}")
+        batch_num = i//BATCH_SIZE + 1
+        batch_start = time.time()
+        print(f"   batch {batch_num}/{total_batches}: {batch}")
+        if progress_callback:
+            progress_callback(f"   Batch {batch_num}/{total_batches}: translating {len(batch)} languages")
         batch_result = translator.translate_fields(compressed_translatable, batch)
         combined_translations.update(batch_result)
+        batch_time = time.time() - batch_start
+        print(f"      Batch took {batch_time:.1f}s")
         if i + BATCH_SIZE < len(needed):
             time.sleep(DELAY_BETWEEN_BATCHES)
+    translation_time = time.time() - translation_start
 
     successful = {}
     for lang, trans in combined_translations.items():
@@ -221,9 +235,12 @@ def sync_ticket_from_data(
         return {"status": "dry_run_preview", "ticket_code": ticket_code,
                 "languages": list(successful.keys()), "preview": preview}
 
+    # Write
+    write_start = time.time()
     payload = dict(ticket_entry)
     payload["datasheets"] = new_datasheets
     result = api.update_ticket(supplier_id, payload)
+    write_time = time.time() - write_start
     if isinstance(result, dict) and "error" in result:
         return {"status": "put_failed", "ticket_code": ticket_code, "detail": result}
 
@@ -233,10 +250,12 @@ def sync_ticket_from_data(
     all_langs = sorted(set(prior_langs) | set(written_langs))
     store.upsert_state("ticket", supplier_id, ticket_code, source_hash, all_langs)
 
+    total_time = time.time() - start_time
+    print(f"✅ Ticket {ticket_code} done in {total_time:.1f}s (verify: {verify_time:.1f}s, translate: {translation_time:.1f}s, write: {write_time:.1f}s)")
     return {"status": "updated", "ticket_code": ticket_code, "languages_written": written_langs}
 
 
-# Original sync_ticket wrapper (for single ticket mode)
+# Original sync_ticket wrapper
 def sync_ticket(api, translator, store: StateStore,
                 supplier_id: str, ticket_code: str,
                 target_languages: List[str],
@@ -248,7 +267,7 @@ def sync_ticket(api, translator, store: StateStore,
                                  target_languages, dry_run=dry_run, force=force)
 
 
-# ---- Option functions ----
+# ---- Option functions (with timing) ----
 def get_existing_option_content(option_entry: Dict[str, Any], lang: str) -> Dict[str, str]:
     fields = {}
     remarks = option_entry.get("remarks", {})
@@ -332,7 +351,7 @@ def sync_ticket_option_from_data(
     dry_run: bool = True,
     force: bool = False,
 ) -> Dict[str, Any]:
-    """Sync one option using pre‑fetched option data."""
+    start_time = time.time()
     translatable = extract_translatable_fields_from_option(option_entry)
     if not translatable:
         return {"status": "skipped", "option_code": option_code, "reason": "no translatable fields"}
@@ -354,9 +373,11 @@ def sync_ticket_option_from_data(
 
     print(f"🌐 Translating option {option_code}: {len(needed)} languages")
     combined_translations = {}
+    total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
     for i in range(0, len(needed), BATCH_SIZE):
         batch = needed[i:i+BATCH_SIZE]
-        print(f"   batch {i//BATCH_SIZE+1}: {batch}")
+        batch_num = i//BATCH_SIZE + 1
+        print(f"   batch {batch_num}/{total_batches}: {batch}")
         batch_result = translator.translate_fields(compressed_translatable, batch)
         combined_translations.update(batch_result)
         if i + BATCH_SIZE < len(needed):
@@ -395,10 +416,11 @@ def sync_ticket_option_from_data(
     all_langs = sorted(set(prior_langs) | set(written_langs))
     store.upsert_state("ticket_option", supplier_id, entity_id, source_hash, all_langs, option_code=option_code)
 
+    elapsed = time.time() - start_time
+    print(f"✅ Option {option_code} done in {elapsed:.1f}s")
     return {"status": "updated", "option_code": option_code, "languages_written": written_langs}
 
 
-# New: sync all options using pre‑fetched ticket data (avoids extra GET)
 def sync_all_options_for_ticket_from_data(
     api,
     translator,
@@ -416,7 +438,6 @@ def sync_all_options_for_ticket_from_data(
     ticket_code = ticket_entry.get("code")
     results = []
     for opt_code in modality_codes:
-        # Fetch each option individually (no way to batch)
         option = api.get_ticket_option(supplier_id, ticket_code, opt_code)
         if isinstance(option, dict) and "error" in option:
             results.append({"status": "fetch_failed", "option_code": opt_code, "detail": option})
@@ -429,7 +450,7 @@ def sync_all_options_for_ticket_from_data(
     return results
 
 
-# Legacy wrapper for backward compatibility (uses extra GET)
+# Legacy wrapper (uses extra GET) – kept for single ticket mode
 def sync_all_options_for_ticket(api, translator, store: StateStore,
                                 supplier_id: str, ticket_code: str,
                                 target_languages: List[str],
