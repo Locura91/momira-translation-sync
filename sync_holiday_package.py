@@ -36,23 +36,31 @@ BATCH_SIZE = 5  # Translate this many languages per API call
 
 def filter_successful_translations(
     translations: Dict[str, Dict[str, str]],
-    source_fields: Dict[str, str]
+    source_fields: Dict[str, str],
+    failed_languages=None,
 ) -> Dict[str, Dict[str, str]]:
     """
-    Return only languages where at least one field's translation differs from
-    the source. Logs warnings for skipped languages.
+    Return every language translate_in_batches did NOT report as failed.
+
+    This used to instead drop any language whose translated text was
+    identical to the source, on the theory that meant the call had silently
+    failed. That's wrong for short/common words that legitimately translate
+    to themselves (or a near-identical spelling) in several languages — a
+    real, correct translation would get silently and permanently discarded.
+    Confirmed live on a Ticket modality literally named "Standard", which
+    correctly translates to "Standard" in French/German/Polish/etc. — the
+    old check treated that as a failure every single run. Now we only
+    exclude languages translate_in_batches itself reports as having failed
+    (see its docstring in translator.py, `failed_languages`); everything
+    else is trusted as real, whether or not the text happens to match EN.
     """
+    failed_languages = failed_languages or set()
     successful = {}
     for lang, trans in translations.items():
-        changed = False
-        for field, src in source_fields.items():
-            if trans.get(field) != src:
-                changed = True
-                break
-        if changed:
-            successful[lang] = trans
+        if lang in failed_languages:
+            print(f"⚠️  Translation batch for {lang} failed; skipping.")
         else:
-            print(f"⚠️  Translation for {lang} is identical to source; skipping.")
+            successful[lang] = trans
     return successful
 
 
@@ -156,13 +164,16 @@ def sync_one_package_entry(api, translator, store: StateStore,
 
     # --- BATCH TRANSLATIONS (run concurrently instead of one-after-another) ---
     print(f"🌐 Translating package {package_id}: {list(translatable.keys())} -> {needed}")
-    combined_translations = translate_in_batches(translator, translatable, needed, batch_size=BATCH_SIZE)
+    combined_translations, failed_languages = translate_in_batches(translator, translatable, needed, batch_size=BATCH_SIZE)
 
-    # Filter out languages that didn't actually change
-    translations = filter_successful_translations(combined_translations, translatable)
+    # Filter out only languages whose batch genuinely failed (see
+    # filter_successful_translations' docstring — no longer "identical to
+    # source == failed", since that wrongly discards correct short-word
+    # translations).
+    translations = filter_successful_translations(combined_translations, translatable, failed_languages)
     if not translations:
         return {"status": "skipped", "package_id": package_id,
-                "reason": "no successful translations (all identical to source)"}
+                "reason": "no successful translations (all batches failed)"}
 
     per_lang_status = {}
     written_languages = []
