@@ -139,7 +139,27 @@ def verify_and_filter_needed(
     current_ticket: Dict[str, Any],
     source_fields: Dict[str, str],
     option_code: str = "",
+    existing_content_fn=None,
 ) -> List[str]:
+    """
+    existing_content_fn: which function to use to read back "does this
+    language already have real translated content". Defaults to
+    get_existing_content_for_language (checks ticket["datasheets"][lang]) —
+    correct for the MAIN ticket, but a ticket OPTION/modality has no
+    "datasheets" key at all (confirmed via a real live GET for modality
+    "Standard English" on ticket USM-T3 — its translatable content lives in
+    "remarks"/"supplements", not "datasheets"). Before this fix, options
+    were always calling the ticket-shaped checker, which found
+    entry.get("datasheets") empty and always returned {} — meaning this
+    verification step could never actually recognize genuinely-already-
+    translated option content. The dedicated get_existing_option_content
+    function already existed in this file for exactly this purpose but was
+    never wired in anywhere; sync_ticket_option_from_data now passes it in
+    explicitly.
+    """
+    if existing_content_fn is None:
+        existing_content_fn = get_existing_content_for_language
+
     state = store.get_state(entity_type, supplier_id, entity_id, option_code)
     if state is None or state["source_hash"] != source_hash:
         needed = list(target_languages)
@@ -151,7 +171,7 @@ def verify_and_filter_needed(
     languages_to_add_to_state = []
 
     for lang in needed:
-        existing = get_existing_content_for_language(current_ticket, lang)
+        existing = existing_content_fn(current_ticket, lang)
         if not existing:
             truly_needed.append(lang)
             continue
@@ -374,7 +394,8 @@ def sync_ticket_option_from_data(
     else:
         needed = verify_and_filter_needed(
             store, "ticket_option", supplier_id, entity_id, source_hash,
-            target_languages, option_entry, translatable, option_code=option_code
+            target_languages, option_entry, translatable, option_code=option_code,
+            existing_content_fn=get_existing_option_content,
         )
 
     if not needed:
