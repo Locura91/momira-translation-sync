@@ -1,417 +1,535 @@
 """
-translator.py — AI translation engine with fallback (Gemini first, then Claude).
+sync_closed_tour.py — Sync Closed Tours (main datasheet + options).
 
-CONFIRMED BUG FIX (verified directly against the installed google-genai SDK,
-same way the earlier response_format bug was caught): the GeminiTranslator
-config previously included a top-level "timeout": 60 key. That is NOT a
-valid field on google.genai.types.GenerateContentConfig — instantiating it
-raises pydantic.ValidationError: "Extra inputs are not permitted
-[type=extra_forbidden]". This meant EVERY Gemini call was failing
-immediately, on every entity type (Holiday Packages, Tickets, Transfers,
-Transports, Hotels). Under TRANSLATION_PROVIDER=fallback, this silently
-fell back to Claude every time (i.e. paying full Claude Haiku prices, not
-the cheaper Gemini price this switch was meant to get, plus ~31s of wasted
-retry/backoff sleep per batch). Under TRANSLATION_PROVIDER=gemini (no
-fallback), every sync call would hard-fail.
+CONFIRMED SCOPE (from real Swagger + real live GET/example data for
+supplier 50370, closed tour TNR-03, "Madagascar's People and Lemurs SIC"):
 
-Fix: a client-side request timeout, if wanted, goes under
-"http_options": {"timeout": <milliseconds>} — NOT a bare "timeout" key.
-We're not setting one at all here (removing it entirely) since the
-retries/backoff loop already handles slow/hanging calls, and an
-overly-aggressive client timeout on a legitimately-slow big-batch call
-would just trigger more retries.
+  MAIN ENTITY translatable content lives in `datasheets{<lang>: {...}}`,
+  the same per-language-keyed-map pattern as Tickets. Confirmed real,
+  populated fields for this tour: name, description, included, excluded,
+  hotels. Also present in the documented schema but NOT populated on this
+  particular tour (so untested against real data, but supported the same
+  "only if present and non-empty" way as everything else in this project):
+  voucherRemarks, meetingPoint, remarksTitle, remarksDescription.
 
-Also restored max_output_tokens to 32768 (was reduced to 8192) — Tickets
-have more fields per language (name, description, meetingPoint,
-activityType, voucherRemarks, departureTime, includes, excludes) than
-Holiday Packages (title, description, ribbonText), so a 10-language batch
-risked truncating mid-JSON at 8192.
+  Unlike Tickets, `included`/`excluded` here are plain HTML STRINGS (e.g.
+  "<ul><li>Airport transfers...</li></ul>"), not string arrays — so no
+  join/split-to-list conversion is needed; they translate exactly like
+  `description` does.
+
+  `hotels` (inside datasheets, per language) is also a plain HTML string —
+  a human-written "planned hotels for this tour" blurb with a bullet list.
+  Confirmed real and worth translating (present in EN, missing in DE on
+  this tour — i.e. genuinely not-yet-translated, exactly the case this
+  tool exists to fix).
+
+  NOT translated (deliberately out of scope for now, confirmed empty on
+  the one real example available — see module-level NOTE below):
+    - itinerary[].description{<lang>: string} — every stop's description
+      map was `{}` (completely empty) on the one real tour we checked, so
+      there is zero real content to validate the key format or confirm
+      this is even actively used. Passed through untouched.
+    - itinerary[].destination — a mix of real Travel Compositor
+      destination codes (e.g. "TNR", "RMFN") and plain city names (e.g.
+      "Ambositra") in the same list; not per-language, so left untouched
+      regardless (same reasoning as Holiday Package `themes`).
+    - supplements[] (the main entity's OWN embedded supplements array,
+      each with `translations{<lang>: ContractClosedTourSupplementTranslationVO}`)
+      — was `[]` (completely empty) on the one real tour checked. Its
+      expanded schema was never obtained either. Passed through untouched.
+      If you find a closed tour with real supplement data, that's the
+      thing to paste next to extend coverage here.
+
+  OPTIONS (fetched separately via GET/PUT .../{closedTourCode}/{optionCode},
+  one call per modalityCode listed on the main entity) use
+  `translations{<lang>: {name, remarks}}` — confirmed via real Swagger AND
+  a real live example (option "Code1" of TNR-03). `remarks` was empty on
+  that example; only `name` was populated.
+
+  IMPORTANT OBSERVED DATA QUALITY CAVEAT (not something this code can or
+  should try to detect/fix): on that same real option, EN's name was
+  literally "Code3" — an apparent placeholder/internal label, not real
+  English content — while DE's name was the genuine, well-written tour
+  name. Since this tool always treats EN as the authoritative source to
+  translate FROM, an option like this will just propagate "Code3" (or
+  whatever nonsense is in EN) into every target language. That is a
+  Travel-Compositor-side data quality issue on this particular option, not
+  a bug here — if you spot this pattern being common rather than a one-off,
+  let's revisit whether option names need a different strategy.
+
+  DISCOVERY / "sync all" LIMITATION: Travel Compositor's Closed Tour API
+  has NO bulk "list all closed tours for a supplier" endpoint (unlike
+  Tickets/Transfers/Transports/Hotels, which all have GET /<type>/{supplierId}
+  returning a list). So there is no fetch_all_closed_tours()/
+  sync_all_closed_tours_for_supplier() here — only single-code entry
+  points. Per your instruction: a human enters the Closed Tour Code:
+  if it exists, translation proceeds; if not, a clear "not_found" status
+  is returned (see sync_closed_tour() below) instead of a raw API error.
 """
 
-import os
-import json
+import re
 import time
-from typing import Dict, List
+from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from dotenv import load_dotenv
+from state_store import StateStore, compute_hash
+from translator import translate_in_batches
 
-load_dotenv()
+ENTITY_TYPE = "closed_tour"
+OPTION_ENTITY_TYPE = "closed_tour_option"
 
-# Default models
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+# ---- Configuration ----
+# Deliberately small: Closed Tour descriptions run MUCH longer than
+# Tickets/Holiday Packages (a full multi-day itinerary write-up, easily
+# thousands of words) — a big batch of languages risks truncating mid-JSON
+# even with the larger output-token caps now in place (Gemini
+# max_output_tokens=32768, Claude max_tokens=64000 — see translator.py).
+# The first live test on the Madagascar tour (a 14-day, several-thousand-
+# word description) burned real time/cost on repeated truncated-response
+# retries with the OLD (too-small) Claude max_tokens=8192 default — now
+# fixed, but keeping this batch size small is still cheap, real insurance:
+# batches run CONCURRENTLY (see translate_in_batches in translator.py), so
+# more/smaller batches cost nothing in wall-clock time.
+DATASHEET_BATCH_SIZE = 2
+OPTION_BATCH_SIZE = 10
+MAX_OPTION_WORKERS = 5  # parallel option fetches, same pattern as Tickets/Transports
 
-TRANSLATION_TOOL = {
-    "name": "submit_translations",
-    "description": "Submit the translated text for every requested field, in every requested target language.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "translations": {
-                "type": "object",
-                "description": (
-                    "Map of target language code -> object mapping each requested field name "
-                    "to its translated text. Every requested language AND every requested field "
-                    "must be present, even if you have to leave a field's translation identical "
-                    "to the source when it's untranslatable (e.g. a product code)."
-                ),
-                "additionalProperties": {
-                    "type": "object",
-                    "additionalProperties": {"type": "string"}
-                }
-            }
-        },
-        "required": ["translations"]
-    }
-}
-
-SYSTEM_PROMPT = """You are a professional travel-industry translator for Momira Travel.
-
-Rules you must always follow:
-- Domain preservation: keep travel-industry terms idiomatic in the target language
-  ("airport transfer", "half-board", "meeting point", "pickup location") rather than
-  literal word-for-word substitutes. Never translate product codes, IDs, or supplier
-  identifiers that appear inside the text.
-- Formatting integrity: preserve HTML tags (<b>, <br>, etc.), Markdown, and template
-  variables (e.g. {duration}, {pickupTime}) EXACTLY as they appear, untouched, in the
-  same position.
-- Tone: professional, inviting, conversion-oriented — the register a travel consumer
-  expects in that market, not a stiff literal translation.
-- Locale-variant awareness: PT vs PT_BR (European vs Brazilian Portuguese) must reflect
-  genuine regional differences in spelling and idiom, not be copies of each other.
-- If a field's source text is empty or whitespace-only, return it unchanged (empty) —
-  do not invent content.
-
-You must respond ONLY by calling the submit_translations tool. Do not write any other text."""
-
-
-class TranslationError(Exception):
-    pass
-
-
-class ProviderRateLimitError(Exception):
-    pass
-
-
-USER_PROMPT_TEMPLATE = (
-    "Translate the following fields from English into these target languages: "
-    "{languages}.\n\n"
-    "Fields (JSON):\n{fields_json}\n\n"
-    "Respond with one entry per target language, each containing every field "
-    "listed above translated into that language."
+# ---- Main closed tour datasheet fields (confirmed + documented-but-untested) ----
+TEXT_FIELDS = (
+    "name", "description", "included", "excluded", "hotels",
+    "voucherRemarks", "meetingPoint", "remarksTitle", "remarksDescription",
 )
 
+# ---- Option fields (confirmed via real example) ----
+OPTION_TEXT_FIELDS = ("name", "remarks")
 
-class ClaudeTranslator:
-    def __init__(self, api_key: str = None, model: str = None):
-        from anthropic import Anthropic
-        self.client = Anthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
-        self.model = model or os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
 
-    def translate_fields(
-        self,
-        source_fields: Dict[str, str],
-        target_languages: List[str],
-        retries: int = 5,
-    ) -> Dict[str, Dict[str, str]]:
-        non_empty_fields = {k: v for k, v in source_fields.items() if isinstance(v, str) and v.strip()}
-        if not non_empty_fields:
-            return {lang: dict(source_fields) for lang in target_languages}
+def strip_html_and_compress(text: str) -> str:
+    if not text:
+        return text
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
-        prompt = (
-            f"Translate the following fields from English into these target languages: "
-            f"{', '.join(target_languages)}.\n\n"
-            f"Fields (JSON):\n{json.dumps(non_empty_fields, ensure_ascii=False, indent=2)}\n\n"
-            f"Call submit_translations with one entry per target language, each containing "
-            f"every field listed above translated into that language."
-        )
 
-        raw_translations = {}
-        for attempt in range(retries + 1):
-            try:
-                response = self.client.messages.create(
-                    model=self.model,
-                    # CONFIRMED via Anthropic's docs (platform.claude.com):
-                    # Claude Haiku 4.5 supports up to 64k output tokens via
-                    # the standard Messages API, no beta header needed. The
-                    # old value here (8192) was ~8x too small for anything
-                    # with a long description (e.g. a multi-day Closed Tour
-                    # itinerary translated across several languages in one
-                    # batch) — the response got cut off mid-generation,
-                    # failed to parse, and retried up to 6 times per batch,
-                    # each attempt generating (and billing for) a large
-                    # truncated response before giving up. That is almost
-                    # certainly what caused the runaway cost/time on the
-                    # first live Closed Tour test.
-                    max_tokens=64000,
-                    system=SYSTEM_PROMPT,
-                    tools=[TRANSLATION_TOOL],
-                    tool_choice={"type": "tool", "name": "submit_translations"},
-                    messages=[{"role": "user", "content": prompt}],
-                    timeout=120,
-                )
-                tool_use = next((b for b in response.content if b.type == "tool_use"), None)
-                if not tool_use:
-                    raise TranslationError("Model did not call submit_translations")
-                raw_translations = tool_use.input.get("translations", {})
+def compress_translatable_fields(fields: Dict[str, str]) -> Dict[str, str]:
+    compressed = {}
+    for key, value in fields.items():
+        if isinstance(value, str):
+            compressed[key] = strip_html_and_compress(value)
+        else:
+            compressed[key] = value
+    return compressed
+
+
+# =========================================================================
+# MAIN CLOSED TOUR (datasheets)
+# =========================================================================
+
+def extract_translatable_fields_from_closed_tour(entry: Dict[str, Any]) -> Dict[str, str]:
+    datasheets = entry.get("datasheets")
+    if not datasheets:
+        return {}
+    en_entry = None
+    for key in ("EN", "EN_US"):
+        if key in datasheets:
+            en_entry = datasheets[key]
+            break
+    if en_entry is None:
+        for key in datasheets:
+            if key.upper().startswith("EN"):
+                en_entry = datasheets[key]
                 break
-            except Exception as e:
-                is_rate_limit = False
-                if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
-                    is_rate_limit = e.response.status_code == 429
-                if not is_rate_limit and '429' in str(e):
-                    is_rate_limit = True
+    if not en_entry:
+        return {}
 
-                if is_rate_limit:
-                    wait = (2 ** attempt) * 5
-                    print(f"🚦 Claude rate limit hit (attempt {attempt+1}). Waiting {wait}s before retry...")
-                    time.sleep(wait)
-                else:
-                    print(f"⚠️  Claude call failed (attempt {attempt+1}/{retries+1}): {e}")
-                    if attempt < retries:
-                        time.sleep(2 ** attempt)
-
-                if attempt == retries:
-                    raise ProviderRateLimitError(f"Claude rate limit exhausted after {retries+1} attempts")
-
-        # Build result, filling gaps
-        result = {}
-        for lang in target_languages:
-            lang_result = {}
-            lang_data = raw_translations.get(lang, {}) if isinstance(raw_translations, dict) else {}
-            for field, source_value in source_fields.items():
-                translated = lang_data.get(field)
-                if not translated or not str(translated).strip():
-                    if field in non_empty_fields:
-                        print(f"⚠️  Missing/empty translation for '{field}' -> {lang}; falling back to English source.")
-                    translated = source_value
-                lang_result[field] = translated
-            result[lang] = lang_result
-        return result
+    fields = {}
+    for f in TEXT_FIELDS:
+        val = en_entry.get(f)
+        if isinstance(val, str) and val.strip():
+            fields[f] = val
+    return fields
 
 
-def _build_gemini_response_schema(fields: Dict[str, str], target_languages: List[str]) -> dict:
-    field_names = list(fields.keys())
-    per_language_schema = {
-        "type": "object",
-        "properties": {name: {"type": "string"} for name in field_names},
-        "required": field_names,
-    }
-    return {
-        "type": "object",
-        "properties": {
-            "translations": {
-                "type": "object",
-                "properties": {lang: per_language_schema for lang in target_languages},
-                "required": target_languages,
-            }
-        },
-        "required": ["translations"],
-    }
+def get_existing_content_for_language(entry: Dict[str, Any], lang: str) -> Dict[str, str]:
+    datasheets = entry.get("datasheets", {})
+    lang_entry = datasheets.get(lang, {})
+    if not lang_entry:
+        return {}
+    fields = {}
+    for f in TEXT_FIELDS:
+        val = lang_entry.get(f)
+        if isinstance(val, str) and val.strip():
+            fields[f] = val
+    return fields
 
 
-class GeminiTranslator:
-    def __init__(self, api_key: str = None, model: str = None):
-        from google import genai
-        self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
-        self.model = model or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
-
-    def translate_fields(
-        self,
-        source_fields: Dict[str, str],
-        target_languages: List[str],
-        retries: int = 5,
-    ) -> Dict[str, Dict[str, str]]:
-        non_empty_fields = {k: v for k, v in source_fields.items() if isinstance(v, str) and v.strip()}
-        if not non_empty_fields:
-            return {lang: dict(source_fields) for lang in target_languages}
-
-        schema = _build_gemini_response_schema(non_empty_fields, target_languages)
-        prompt = USER_PROMPT_TEMPLATE.format(
-            languages=", ".join(target_languages),
-            fields_json=json.dumps(non_empty_fields, ensure_ascii=False, indent=2),
-        )
-
-        raw_translations = {}
-        for attempt in range(retries + 1):
-            try:
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                    config={
-                        "system_instruction": SYSTEM_PROMPT,
-                        "response_mime_type": "application/json",
-                        "response_json_schema": schema,
-                        # 0 = disabled. Flash's "thinking" mode adds real
-                        # latency for a task this simple — we don't need
-                        # reasoning for translation, just fast structured
-                        # output.
-                        "thinking_config": {"thinking_budget": 0},
-                        # Generous cap so a big multi-field batch (e.g.
-                        # Tickets: name/description/meetingPoint/
-                        # activityType/voucherRemarks/departureTime/
-                        # includes/excludes across up to 10 languages at
-                        # once) can't get silently truncated mid-JSON.
-                        "max_output_tokens": 32768,
-                        # NOTE: a client-side request timeout, if wanted,
-                        # goes under http_options (milliseconds) — NOT a
-                        # bare "timeout" key. A bare "timeout" key is not a
-                        # valid GenerateContentConfig field and raises a
-                        # pydantic ValidationError on every single call
-                        # (confirmed against the installed SDK) — this was
-                        # silently breaking every Gemini call and forcing a
-                        # fallback to Claude (or a hard failure with no
-                        # fallback configured). Deliberately omitted here;
-                        # add "http_options": {"timeout": 60000} if a
-                        # client-side timeout is genuinely needed.
-                    },
-                )
-                parsed = json.loads(response.text)
-                raw_translations = parsed.get("translations", {})
-                if not raw_translations:
-                    raise TranslationError("Model returned no 'translations' key")
-                break
-            except Exception as e:
-                is_rate_limit = False
-                if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
-                    is_rate_limit = e.response.status_code == 429
-                if not is_rate_limit and ('429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e)):
-                    is_rate_limit = True
-
-                if is_rate_limit:
-                    wait = (2 ** attempt) * 5
-                    print(f"🚦 Gemini rate limit hit (attempt {attempt+1}). Waiting {wait}s before retry...")
-                    time.sleep(wait)
-                else:
-                    print(f"⚠️  Gemini call failed (attempt {attempt+1}/{retries+1}): {e}")
-                    if attempt < retries:
-                        time.sleep(2 ** attempt)
-
-                if attempt == retries:
-                    raise ProviderRateLimitError(f"Gemini rate limit exhausted after {retries+1} attempts")
-
-        result = {}
-        for lang in target_languages:
-            lang_result = {}
-            lang_data = raw_translations.get(lang, {}) if isinstance(raw_translations, dict) else {}
-            for field, source_value in source_fields.items():
-                translated = lang_data.get(field)
-                if not translated or not str(translated).strip():
-                    if field in non_empty_fields:
-                        print(f"⚠️  Missing/empty translation for '{field}' -> {lang}; falling back to English source.")
-                    translated = source_value
-                lang_result[field] = translated
-            result[lang] = lang_result
-        return result
+def build_updated_datasheets(
+    original_datasheets: Dict[str, Any],
+    translations_by_lang: Dict[str, Dict[str, str]],
+    en_entry: Dict[str, Any],
+) -> Dict[str, Any]:
+    new_datasheets = dict(original_datasheets)
+    for lang, trans in translations_by_lang.items():
+        base = dict(en_entry)
+        for f, text in trans.items():
+            base[f] = text
+        if lang in original_datasheets:
+            for k, v in original_datasheets[lang].items():
+                if k not in base:
+                    base[k] = v
+        new_datasheets[lang] = base
+    return new_datasheets
 
 
-class FallbackTranslator:
-    def __init__(self, primary: GeminiTranslator, fallback: ClaudeTranslator):
-        self.primary = primary
-        self.fallback = fallback
-
-    def translate_fields(
-        self,
-        source_fields: Dict[str, str],
-        target_languages: List[str],
-        retries: int = 5,
-    ) -> Dict[str, Dict[str, str]]:
-        try:
-            result = self.primary.translate_fields(source_fields, target_languages, retries)
-            # Check if all languages are still English (no changes)
-            all_english = True
-            for lang in target_languages:
-                for field, src in source_fields.items():
-                    if result.get(lang, {}).get(field) != src:
-                        all_english = False
-                        break
-                if not all_english:
-                    break
-            if all_english:
-                print("⚠️  Primary provider returned only English fallback. Switching to Claude for this batch...")
-                return self.fallback.translate_fields(source_fields, target_languages, retries)
-            return result
-        except (ProviderRateLimitError, Exception) as e:
-            print(f"⚠️  Primary provider failed: {e}. Switching to Claude for this batch...")
-            return self.fallback.translate_fields(source_fields, target_languages, retries)
-
-
-def translate_in_batches(
-    translator,
-    fields: Dict[str, str],
+def verify_and_filter_needed(
+    store: StateStore,
+    entity_type: str,
+    supplier_id: str,
+    entity_id: str,
+    source_hash: str,
     target_languages: List[str],
-    batch_size: int = 10,
-    max_workers: int = 4,
-) -> Dict[str, Dict[str, str]]:
-    """
-    Speed fix for the translation step: every sync_*.py file used to split
-    target_languages into batches of batch_size and translate them
-    SEQUENTIALLY, sleeping 2 seconds between each batch for no functional
-    reason (an artifact from early rate-limit caution). For a full
-    30-language run at batch_size=10, that was 3 sequential API calls plus
-    ~4s of pure dead-time sleep; at batch_size=5 (Holiday Packages), 6
-    sequential calls plus ~10s of dead-time. Worse, a single batch raising
-    an exception had no per-batch handling, so it could abort the ENTIRE
-    sync for that item.
-
-    This runs the batches CONCURRENTLY instead (bounded by max_workers, so
-    we don't blast the provider with unlimited parallel requests), and
-    isolates failures per-batch: if one batch's translate_fields() call
-    raises, only that batch's languages fall back to English — every other
-    concurrent batch still completes normally. Each provider's own
-    retry/backoff/rate-limit handling (in GeminiTranslator/ClaudeTranslator/
-    FallbackTranslator) is unchanged and still applies within each batch.
-
-    Wall-clock time for a full run becomes roughly
-    (number of batches / max_workers) * (single batch's own latency),
-    instead of (number of batches) * (single batch's own latency + 2s).
-    """
-    batches = [target_languages[i:i + batch_size] for i in range(0, len(target_languages), batch_size)]
-    if len(batches) <= 1:
-        # No concurrency needed/possible for a single batch.
-        try:
-            return translator.translate_fields(fields, target_languages)
-        except Exception as e:
-            print(f"⚠️  Batch {target_languages} failed entirely: {e} — falling back to English for these languages.")
-            return {lang: dict(fields) for lang in target_languages}
-
-    combined: Dict[str, Dict[str, str]] = {}
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as executor:
-        future_to_batch = {
-            executor.submit(translator.translate_fields, fields, batch): batch
-            for batch in batches
-        }
-        for future in as_completed(future_to_batch):
-            batch = future_to_batch[future]
-            try:
-                result = future.result()
-                combined.update(result)
-            except Exception as e:
-                print(f"⚠️  Batch {batch} failed entirely: {e} — falling back to English for these languages.")
-                for lang in batch:
-                    combined[lang] = dict(fields)
-    return combined
-
-
-def required_api_key_env_var() -> str:
-    provider = (os.getenv("TRANSLATION_PROVIDER") or "gemini").strip().lower()
-    if provider == "fallback":
-        return "GEMINI_API_KEY"
-    return "GEMINI_API_KEY" if provider == "gemini" else "ANTHROPIC_API_KEY"
-
-
-def get_translator(api_key: str = None, model: str = None):
-    provider = (os.getenv("TRANSLATION_PROVIDER") or "gemini").strip().lower()
-    if provider == "gemini":
-        return GeminiTranslator(api_key=api_key, model=model)
-    elif provider == "claude":
-        return ClaudeTranslator(api_key=api_key, model=model)
-    elif provider == "fallback":
-        gemini = GeminiTranslator(api_key=os.getenv("GEMINI_API_KEY"), model=model)
-        claude = ClaudeTranslator(api_key=os.getenv("ANTHROPIC_API_KEY"), model=model)
-        return FallbackTranslator(gemini, claude)
+    current_entry: Dict[str, Any],
+    source_fields: Dict[str, str],
+    option_code: str = "",
+) -> List[str]:
+    state = store.get_state(entity_type, supplier_id, entity_id, option_code)
+    if state is None or state["source_hash"] != source_hash:
+        needed = list(target_languages)
     else:
-        raise ValueError(
-            f"Unknown TRANSLATION_PROVIDER '{provider}' — expected 'gemini', 'claude', or 'fallback'."
+        already_done = set(state["translated_languages"])
+        needed = [lang for lang in target_languages if lang not in already_done]
+
+    truly_needed = []
+    languages_to_add_to_state = []
+
+    for lang in needed:
+        existing = get_existing_content_for_language(current_entry, lang) if not option_code \
+            else get_existing_option_content_for_language(current_entry, lang)
+        if not existing:
+            truly_needed.append(lang)
+            continue
+        is_identical = all(existing.get(f) == src for f, src in source_fields.items())
+        if is_identical:
+            truly_needed.append(lang)
+        else:
+            languages_to_add_to_state.append(lang)
+
+    if languages_to_add_to_state:
+        prior_state = store.get_state(entity_type, supplier_id, entity_id, option_code)
+        prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
+        all_langs = sorted(set(prior_langs) | set(languages_to_add_to_state))
+        store.upsert_state(entity_type, supplier_id, entity_id, source_hash, all_langs, option_code=option_code)
+
+    return truly_needed
+
+
+def sync_closed_tour_from_data(
+    api,
+    translator,
+    store: StateStore,
+    supplier_id: str,
+    closed_tour_entry: Dict[str, Any],
+    target_languages: List[str],
+    dry_run: bool = True,
+    force: bool = False,
+) -> Dict[str, Any]:
+    start_time = time.time()
+    closed_tour_code = closed_tour_entry.get("code")
+    if not closed_tour_code:
+        return {"status": "skipped", "reason": "no 'code' field on closed tour entry"}
+
+    # Same rule as every other entity type in this project: only active
+    # tours get translated. If Closed Tours should NOT follow this rule,
+    # tell me and I'll remove this check.
+    if closed_tour_entry.get("active") is not True:
+        return {"status": "skipped", "closed_tour_code": closed_tour_code, "reason": "active is not true"}
+
+    datasheets = closed_tour_entry.get("datasheets")
+    if not datasheets:
+        return {"status": "skipped", "closed_tour_code": closed_tour_code, "reason": "no datasheets"}
+
+    translatable = extract_translatable_fields_from_closed_tour(closed_tour_entry)
+    if not translatable:
+        return {"status": "skipped", "closed_tour_code": closed_tour_code, "reason": "no translatable fields found"}
+
+    source_hash = compute_hash(translatable)
+    if force:
+        needed = list(target_languages)
+    else:
+        needed = verify_and_filter_needed(
+            store, ENTITY_TYPE, supplier_id, closed_tour_code, source_hash,
+            target_languages, closed_tour_entry, translatable
         )
+
+    if not needed:
+        return {"status": "up_to_date", "closed_tour_code": closed_tour_code}
+
+    print(f"🌐 Translating closed tour {closed_tour_code} ('{translatable.get('name', '')}'): "
+          f"fields={list(translatable.keys())} -> {needed}")
+
+    compressed_translatable = compress_translatable_fields(translatable)
+    translation_start = time.time()
+    combined_translations = translate_in_batches(
+        translator, compressed_translatable, needed, batch_size=DATASHEET_BATCH_SIZE
+    )
+    translation_time = time.time() - translation_start
+
+    successful = {}
+    for lang, trans in combined_translations.items():
+        changed = any(trans.get(f) != src for f, src in translatable.items())
+        if changed:
+            successful[lang] = trans
+        else:
+            print(f"⚠️  Translation for {lang} identical to source; skipping.")
+
+    if not successful:
+        return {"status": "skipped", "closed_tour_code": closed_tour_code, "reason": "no successful translations"}
+
+    en_entry = datasheets.get("EN") or datasheets.get("EN_US") or {}
+    new_datasheets = build_updated_datasheets(datasheets, successful, en_entry)
+
+    if dry_run:
+        preview = {lang: {k: v for k, v in trans.items() if k in TEXT_FIELDS}
+                   for lang, trans in successful.items()}
+        return {"status": "dry_run_preview", "closed_tour_code": closed_tour_code,
+                "languages": list(successful.keys()), "preview": preview}
+
+    write_start = time.time()
+    # Full copy of the original entry, only datasheets replaced — itinerary,
+    # supplements, images, pricing, modalityCodes, etc. all pass through
+    # untouched. Safe here because PUT's documented request schema
+    # (ContractClosedTourVO) is confirmed IDENTICAL to the GET response
+    # schema (unlike Holiday Packages, where GET/PUT schemas diverged).
+    payload = dict(closed_tour_entry)
+    payload["datasheets"] = new_datasheets
+    result = api.update_closed_tour(supplier_id, payload)
+    write_time = time.time() - write_start
+    if isinstance(result, dict) and "error" in result:
+        return {"status": "put_failed", "closed_tour_code": closed_tour_code, "detail": result}
+
+    written_langs = list(successful.keys())
+    prior_state = store.get_state(ENTITY_TYPE, supplier_id, closed_tour_code)
+    prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
+    all_langs = sorted(set(prior_langs) | set(written_langs))
+    store.upsert_state(ENTITY_TYPE, supplier_id, closed_tour_code, source_hash, all_langs)
+
+    total_time = time.time() - start_time
+    print(f"✅ Closed tour {closed_tour_code} done in {total_time:.1f}s "
+          f"(translate: {translation_time:.1f}s, write: {write_time:.1f}s)")
+    return {"status": "updated", "closed_tour_code": closed_tour_code, "languages_written": written_langs}
+
+
+# =========================================================================
+# OPTIONS
+# =========================================================================
+
+def extract_translatable_fields_from_option(option_entry: Dict[str, Any]) -> Dict[str, str]:
+    fields = {}
+    translations = option_entry.get("translations", {})
+    en_entry = translations.get("EN") or translations.get("EN_US") or {}
+    if isinstance(en_entry, dict):
+        for f in OPTION_TEXT_FIELDS:
+            val = en_entry.get(f)
+            if isinstance(val, str) and val.strip():
+                fields[f] = val
+    return fields
+
+
+def get_existing_option_content_for_language(option_entry: Dict[str, Any], lang: str) -> Dict[str, str]:
+    translations = option_entry.get("translations", {})
+    lang_entry = translations.get(lang, {})
+    if not isinstance(lang_entry, dict):
+        return {}
+    fields = {}
+    for f in OPTION_TEXT_FIELDS:
+        val = lang_entry.get(f)
+        if isinstance(val, str) and val.strip():
+            fields[f] = val
+    return fields
+
+
+def build_updated_option(
+    original_option: Dict[str, Any],
+    translations_by_lang: Dict[str, Dict[str, str]],
+) -> Dict[str, Any]:
+    new_option = dict(original_option)
+    translations = dict(original_option.get("translations", {}))
+    for lang, trans in translations_by_lang.items():
+        lang_trans = dict(translations.get(lang, {})) if isinstance(translations.get(lang), dict) else {}
+        for f in OPTION_TEXT_FIELDS:
+            if f in trans:
+                lang_trans[f] = trans[f]
+        translations[lang] = lang_trans
+    new_option["translations"] = translations
+    return new_option
+
+
+def sync_closed_tour_option_from_data(
+    api,
+    translator,
+    store: StateStore,
+    supplier_id: str,
+    option_entry: Dict[str, Any],
+    closed_tour_code: str,
+    option_code: str,
+    target_languages: List[str],
+    dry_run: bool = True,
+    force: bool = False,
+) -> Dict[str, Any]:
+    start_time = time.time()
+    translatable = extract_translatable_fields_from_option(option_entry)
+    if not translatable:
+        return {"status": "skipped", "option_code": option_code, "reason": "no translatable fields"}
+
+    source_hash = compute_hash(translatable)
+    entity_id = f"{closed_tour_code}|{option_code}"
+    if force:
+        needed = list(target_languages)
+    else:
+        needed = verify_and_filter_needed(
+            store, OPTION_ENTITY_TYPE, supplier_id, entity_id, source_hash,
+            target_languages, option_entry, translatable, option_code=option_code
+        )
+
+    if not needed:
+        return {"status": "up_to_date", "option_code": option_code}
+
+    compressed_translatable = compress_translatable_fields(translatable)
+    combined_translations = translate_in_batches(
+        translator, compressed_translatable, needed, batch_size=OPTION_BATCH_SIZE
+    )
+
+    successful = {}
+    for lang, trans in combined_translations.items():
+        changed = any(trans.get(f) != src for f, src in translatable.items())
+        if changed:
+            successful[lang] = trans
+        else:
+            print(f"⚠️  Translation for {lang} identical to source; skipping.")
+
+    if not successful:
+        return {"status": "skipped", "option_code": option_code, "reason": "no successful translations"}
+
+    updated_option = build_updated_option(option_entry, successful)
+
+    if dry_run:
+        preview = {lang: {k: v for k, v in trans.items() if k in OPTION_TEXT_FIELDS}
+                   for lang, trans in successful.items()}
+        return {"status": "dry_run_preview", "option_code": option_code,
+                "languages": list(successful.keys()), "preview": preview}
+
+    result = api.update_closed_tour_option(supplier_id, closed_tour_code, updated_option)
+    if isinstance(result, dict) and "error" in result:
+        return {"status": "put_failed", "option_code": option_code, "detail": result}
+
+    written_langs = list(successful.keys())
+    prior_state = store.get_state(OPTION_ENTITY_TYPE, supplier_id, entity_id, option_code=option_code)
+    prior_langs = prior_state["translated_languages"] if prior_state and prior_state["source_hash"] == source_hash else []
+    all_langs = sorted(set(prior_langs) | set(written_langs))
+    store.upsert_state(OPTION_ENTITY_TYPE, supplier_id, entity_id, source_hash, all_langs, option_code=option_code)
+
+    elapsed = time.time() - start_time
+    print(f"✅ Option {option_code} done in {elapsed:.1f}s")
+    return {"status": "updated", "option_code": option_code, "languages_written": written_langs}
+
+
+def sync_all_options_for_closed_tour_from_data(
+    api,
+    translator,
+    store: StateStore,
+    supplier_id: str,
+    closed_tour_entry: Dict[str, Any],
+    target_languages: List[str],
+    dry_run: bool = True,
+    force: bool = False,
+) -> List[Dict[str, Any]]:
+    modality_codes = closed_tour_entry.get("modalityCodes", [])
+    if not modality_codes:
+        return [{"status": "skipped", "closed_tour_code": closed_tour_entry.get("code"), "reason": "no options"}]
+
+    closed_tour_code = closed_tour_entry.get("code")
+    option_entries = {}
+    with ThreadPoolExecutor(max_workers=MAX_OPTION_WORKERS) as executor:
+        future_to_code = {
+            executor.submit(api.get_closed_tour_option, supplier_id, closed_tour_code, opt_code): opt_code
+            for opt_code in modality_codes
+        }
+        for future in as_completed(future_to_code):
+            opt_code = future_to_code[future]
+            try:
+                option = future.result()
+                if isinstance(option, dict) and "error" in option:
+                    option_entries[opt_code] = {"error": option}
+                else:
+                    option_entries[opt_code] = option
+            except Exception as e:
+                option_entries[opt_code] = {"error": str(e)}
+
+    results = []
+    for opt_code in modality_codes:
+        option = option_entries.get(opt_code)
+        if option is None:
+            results.append({"status": "fetch_failed", "option_code": opt_code, "detail": "No response"})
+            continue
+        if isinstance(option, dict) and "error" in option:
+            results.append({"status": "fetch_failed", "option_code": opt_code, "detail": option["error"]})
+            continue
+        result = sync_closed_tour_option_from_data(
+            api, translator, store, supplier_id, option, closed_tour_code, opt_code,
+            target_languages, dry_run=dry_run, force=force
+        )
+        results.append(result)
+    return results
+
+
+# =========================================================================
+# ENTRY POINT (single closed tour code — no bulk "sync all", see module docstring)
+# =========================================================================
+
+def sync_closed_tour(
+    api,
+    translator,
+    store: StateStore,
+    supplier_id: str,
+    closed_tour_code: str,
+    target_languages: List[str],
+    dry_run: bool = True,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """
+    The single entry point for Closed Tours: fetches by code, and if the
+    code doesn't exist for this supplier, returns a clear "not_found"
+    status (rather than a raw API error) so the calling UI can show the
+    human an unambiguous "that code wasn't found" message — per your
+    instruction: check availability, translate if found, error clearly if
+    not.
+    """
+    entry = api.get_closed_tour(supplier_id, closed_tour_code)
+    if isinstance(entry, dict) and "error" in entry:
+        error_code = entry.get("error")
+        if error_code == 404:
+            return {
+                "status": "not_found",
+                "closed_tour_code": closed_tour_code,
+                "reason": (
+                    f"No closed tour found for supplier {supplier_id} with code "
+                    f"'{closed_tour_code}'. Double-check the code and try again."
+                ),
+            }
+        return {"status": "fetch_failed", "closed_tour_code": closed_tour_code, "detail": entry}
+
+    main_result = sync_closed_tour_from_data(
+        api, translator, store, supplier_id, entry, target_languages,
+        dry_run=dry_run, force=force
+    )
+
+    option_results = sync_all_options_for_closed_tour_from_data(
+        api, translator, store, supplier_id, entry, target_languages,
+        dry_run=dry_run, force=force
+    ) if isinstance(main_result, dict) and main_result.get("status") not in ("fetch_failed",) else []
+
+    if isinstance(main_result, dict):
+        main_result["options"] = option_results
+
+    return main_result
