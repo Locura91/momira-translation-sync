@@ -25,11 +25,20 @@ OFFER_TEXT_FIELDS = ("description",)
 
 
 def strip_html_and_compress(text: str) -> str:
-    if not text:
-        return text
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+    """
+    NO-OP passthrough now. This used to strip every HTML tag out of a
+    field before sending it to the translator, which silently destroyed
+    any real formatting the source field had (bullet lists, bold, etc.).
+    translator.py's SYSTEM_PROMPT already explicitly instructs the model
+    to "preserve HTML tags ... EXACTLY as they appear, untouched, in the
+    same position" — but that instruction is meaningless if the tags are
+    stripped out before the model ever sees them. Confirmed as the cause
+    of translated Closed Tour fields losing all formatting (came back as
+    flat <p> text instead of the original's <ul><li>/<b> structure); this
+    file shares the exact same bug for any HTML-bearing field, so it's
+    fixed the same way here.
+    """
+    return text
 
 
 def compress_translatable_fields(fields: Dict[str, str]) -> Dict[str, str]:
