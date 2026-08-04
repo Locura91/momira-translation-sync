@@ -132,12 +132,24 @@ class ClaudeTranslator:
             try:
                 response = self.client.messages.create(
                     model=self.model,
-                    max_tokens=8192,
+                    # CONFIRMED via Anthropic's docs (platform.claude.com):
+                    # Claude Haiku 4.5 supports up to 64k output tokens via
+                    # the standard Messages API, no beta header needed. The
+                    # old value here (8192) was ~8x too small for anything
+                    # with a long description (e.g. a multi-day Closed Tour
+                    # itinerary translated across several languages in one
+                    # batch) — the response got cut off mid-generation,
+                    # failed to parse, and retried up to 6 times per batch,
+                    # each attempt generating (and billing for) a large
+                    # truncated response before giving up. That is almost
+                    # certainly what caused the runaway cost/time on the
+                    # first live Closed Tour test.
+                    max_tokens=64000,
                     system=SYSTEM_PROMPT,
                     tools=[TRANSLATION_TOOL],
                     tool_choice={"type": "tool", "name": "submit_translations"},
                     messages=[{"role": "user", "content": prompt}],
-                    timeout=60,
+                    timeout=120,
                 )
                 tool_use = next((b for b in response.content if b.type == "tool_use"), None)
                 if not tool_use:
