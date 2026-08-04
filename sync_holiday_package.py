@@ -7,6 +7,7 @@ import json
 from typing import Dict, Any, List, Optional
 
 from state_store import StateStore, compute_hash
+from translator import translate_in_batches
 
 ENTITY_TYPE = "holiday_package"
 TEXT_FIELDS = ("title", "description", "ribbonText")
@@ -137,13 +138,9 @@ def sync_one_package_entry(api, translator, store: StateStore,
     if not needed:
         return {"status": "up_to_date", "package_id": package_id}
 
-    # --- BATCH TRANSLATIONS ---
-    combined_translations = {}
-    for i in range(0, len(needed), BATCH_SIZE):
-        batch = needed[i:i+BATCH_SIZE]
-        print(f"🌐 Translating package {package_id} (batch {i//BATCH_SIZE + 1}): {batch}")
-        batch_result = translator.translate_fields(translatable, batch)
-        combined_translations.update(batch_result)
+    # --- BATCH TRANSLATIONS (run concurrently instead of one-after-another) ---
+    print(f"🌐 Translating package {package_id}: {list(translatable.keys())} -> {needed}")
+    combined_translations = translate_in_batches(translator, translatable, needed, batch_size=BATCH_SIZE)
 
     # Filter out languages that didn't actually change
     translations = filter_successful_translations(combined_translations, translatable)
