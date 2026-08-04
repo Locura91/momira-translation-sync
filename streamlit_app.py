@@ -70,6 +70,10 @@ from sync_hotel import (
     fetch_all_hotels,
 )
 
+# Closed Tours (no bulk "list all" endpoint exists — single code only, see
+# sync_closed_tour.py's module docstring)
+from sync_closed_tour import sync_closed_tour
+
 DEFAULT_TARGET_LANGUAGES = [
     "FR", "SL", "PL", "DE", "SK", "AR", "HR", "HU", "AZ", "NL", "ES", "TR",
     "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS", "TH", "EL", "FI", "JA",
@@ -79,7 +83,7 @@ TEST_LANGUAGES = ["FR", "DE"]
 
 st.set_page_config(page_title="Momira Travel — Translator", page_icon="🌐")
 st.title("🌐 Momira Travel — Translation Sync")
-st.caption("Translate Holiday Packages, Tickets, Transfers, Transports, or Hotels (live mode).")
+st.caption("Translate Holiday Packages, Tickets, Transfers, Transports, Hotels, or Closed Tours (live mode).")
 
 missing = [
     k for k in (required_api_key_env_var(), "TRAVELC_USERNAME", "TRAVELC_PASSWORD")
@@ -108,7 +112,7 @@ with st.sidebar:
     st.header("Settings")
     entity_type = st.radio(
         "What to translate?",
-        ["Holiday Packages", "Tickets", "Transfers", "Transports", "Hotels"]
+        ["Holiday Packages", "Tickets", "Transfers", "Transports", "Hotels", "Closed Tours"]
     )
 
     # ---- Holiday Packages ----
@@ -190,7 +194,7 @@ with st.sidebar:
             limit = limit_input or None
 
     # ---- Hotels ----
-    else:  # Hotels
+    elif entity_type == "Hotels":
         suppliers = fetch_suppliers()
         if suppliers:
             supplier_options = {name: id for id, name in suppliers}
@@ -210,6 +214,28 @@ with st.sidebar:
         if scope == "All hotels":
             limit_input = st.number_input("Limit to first N hotels (0 = no limit)", min_value=0, value=5)
             limit = limit_input or None
+
+    # ---- Closed Tours ----
+    # No bulk "list all" endpoint exists for Closed Tours in Travel
+    # Compositor's API (unlike Tickets/Transfers/Transports/Hotels), so
+    # there's no "All closed tours" option here — just supplier + a
+    # required Closed Tour Code, checked for existence when you click
+    # Translate (a clear "not found" message shows if the code is wrong,
+    # instead of a raw API error).
+    else:  # Closed Tours
+        suppliers = fetch_suppliers()
+        if suppliers:
+            supplier_options = {name: id for id, name in suppliers}
+            selected_name = st.selectbox("Select Supplier", options=list(supplier_options.keys()))
+            supplier_id = str(supplier_options[selected_name])
+            st.caption(f"Using supplier ID: {supplier_id}")
+        else:
+            supplier_id = st.text_input("Supplier ID (numeric)", value=os.getenv("TRAVELC_SUPPLIER_ID", ""))
+            if not supplier_id:
+                st.warning("Please enter a supplier ID.")
+
+        closed_tour_code = st.text_input("Closed Tour Code (e.g., TNR-03)")
+        st.caption("Closed Tours have no bulk listing in the API — one code at a time for now.")
 
     # ---- Common language settings ----
     lang_mode = st.radio(
@@ -439,7 +465,7 @@ if st.button("🚀 Translate now", type="primary"):
                 progress_placeholder.empty()
 
         # ---- Hotels ----
-        else:  # Hotels
+        elif entity_type == "Hotels":
             if scope == "One specific provider code":
                 if not provider_code:
                     st.error("Enter a Provider Code first.")
@@ -487,6 +513,26 @@ if st.button("🚀 Translate now", type="primary"):
                     results.append(hotel_result)
                     log_message(f"   ✅ Finished hotel {provider_code}")
                 progress_placeholder.empty()
+
+        # ---- Closed Tours ----
+        # Single-code only (no bulk list endpoint). sync_closed_tour()
+        # returns a clear "not_found" status if the code doesn't exist for
+        # this supplier, instead of a raw API error.
+        else:  # Closed Tours
+            if not closed_tour_code:
+                st.error("Enter a Closed Tour Code first.")
+                st.stop()
+            log_message(f"📋 Checking closed tour {closed_tour_code} for supplier {supplier_id}...")
+            result = sync_closed_tour(
+                api, translator, store, supplier_id, closed_tour_code, target_languages,
+                dry_run=False, force=force
+            )
+            if result.get("status") == "not_found":
+                st.error(f"❌ {result.get('reason', 'Closed tour not found.')}")
+                log_message(f"   ❌ Not found: {closed_tour_code}")
+            else:
+                log_message(f"   → {result.get('status', 'unknown')}")
+            results = [result]
 
     # ---- Summary ----
     by_status = {}
