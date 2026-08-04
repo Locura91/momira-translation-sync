@@ -9,7 +9,7 @@ from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from state_store import StateStore, compute_hash
-from translator import get_translator
+from translator import get_translator, translate_in_batches
 
 # ---- Configuration ----
 BATCH_SIZE = 10
@@ -21,11 +21,20 @@ MAIN_TEXT_FIELDS = ("name", "description")
 
 
 def strip_html_and_compress(text: str) -> str:
-    if not text:
-        return text
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+    """
+    NO-OP passthrough now. This used to strip every HTML tag out of a
+    field before sending it to the translator, which silently destroyed
+    any real formatting the source field had (bullet lists, bold, etc.).
+    translator.py's SYSTEM_PROMPT already explicitly instructs the model
+    to "preserve HTML tags ... EXACTLY as they appear, untouched, in the
+    same position" — but that instruction is meaningless if the tags are
+    stripped out before the model ever sees them. Confirmed as the cause
+    of translated Closed Tour fields losing all formatting (came back as
+    flat <p> text instead of the original's <ul><li>/<b> structure); this
+    file shares the exact same bug for any HTML-bearing field, so it's
+    fixed the same way here.
+    """
+    return text
 
 
 def compress_translatable_fields(fields: Dict[str, str]) -> Dict[str, str]:
@@ -213,17 +222,8 @@ def sync_transport_from_data(
 
     compressed_translatable = compress_translatable_fields(translatable)
 
-    combined_translations = {}
-    total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
     translation_start = time.time()
-    for i in range(0, len(needed), BATCH_SIZE):
-        batch = needed[i:i+BATCH_SIZE]
-        batch_num = i//BATCH_SIZE + 1
-        print(f"   batch {batch_num}/{total_batches}: {batch}")
-        batch_result = translator.translate_fields(compressed_translatable, batch)
-        combined_translations.update(batch_result)
-        if i + BATCH_SIZE < len(needed):
-            time.sleep(DELAY_BETWEEN_BATCHES)
+    combined_translations = translate_in_batches(translator, compressed_translatable, needed, batch_size=BATCH_SIZE)
     translation_time = time.time() - translation_start
 
     successful = {}
@@ -401,17 +401,7 @@ def sync_transport_option_from_data(
         return {"status": "up_to_date", "option_code": option_code}
 
     compressed_translatable = compress_translatable_fields(translatable)
-
-    combined_translations = {}
-    total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
-    for i in range(0, len(needed), BATCH_SIZE):
-        batch = needed[i:i+BATCH_SIZE]
-        batch_num = i//BATCH_SIZE + 1
-        print(f"   batch {batch_num}/{total_batches}: {batch}")
-        batch_result = translator.translate_fields(compressed_translatable, batch)
-        combined_translations.update(batch_result)
-        if i + BATCH_SIZE < len(needed):
-            time.sleep(DELAY_BETWEEN_BATCHES)
+    combined_translations = translate_in_batches(translator, compressed_translatable, needed, batch_size=BATCH_SIZE)
 
     successful = {}
     for lang, trans in combined_translations.items():
