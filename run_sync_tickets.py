@@ -20,10 +20,16 @@ from sync_ticket import (
     fetch_all_tickets,
 )
 
+# Reduced from 30 to 19 target languages per your instruction: removed
+# Albanian (SQ), Arabic (AR), Azerbaijani (AZ), Georgian (KA), Japanese (JA),
+# Croatian (HR), Malay (MS), Serbian (SR), Thai (TH), Uzbek (UZ), and
+# Bulgarian (BG) — 11 languages dropped, same list shared across every
+# entity type. Persian/Farsi (Iran) was already absent from the 30-language
+# list before this change, so it wasn't removed again here.
 DEFAULT_TARGET_LANGUAGES = [
-    "FR", "SL", "PL", "DE", "SK", "AR", "HR", "HU", "AZ", "NL", "ES", "TR",
-    "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS", "TH", "EL", "FI", "JA",
-    "SR", "PT", "DA", "IT", "MS", "SQ",
+    "FR", "SL", "PL", "DE", "SK", "HU", "NL", "ES", "TR",
+    "RU", "NO", "SV", "RO", "CS", "EL", "FI",
+    "PT", "DA", "IT",
 ]
 TEST_LANGUAGES = ["FR", "DE"]
 
