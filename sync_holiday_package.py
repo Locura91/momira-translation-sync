@@ -146,9 +146,16 @@ def sync_one_package_entry(api, translator, store: StateStore,
     if package_id is None:
         return {"status": "skipped", "reason": "no 'id' field on package entry"}
 
-    # Only translate active packages
+    # Only translate packages that are BOTH active and visible. Previously
+    # this only checked "active" — "visible" was in WRITABLE_FIELDS (passed
+    # through untouched on every PUT) but never used as a filter, so a
+    # package with active=true but visible=false would still get
+    # translated even though it's not actually shown to customers. Mirrors
+    # the "active" check: missing/non-True is treated the same as False.
     if entry.get("active") is not True:
         return {"status": "skipped", "package_id": package_id, "reason": "active is not true"}
+    if entry.get("visible") is not True:
+        return {"status": "skipped", "package_id": package_id, "reason": "visible is not true"}
 
     translatable = extract_translatable_fields(entry)
     if not translatable:
