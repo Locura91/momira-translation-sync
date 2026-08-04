@@ -352,7 +352,7 @@ def translate_in_batches(
     target_languages: List[str],
     batch_size: int = 10,
     max_workers: int = 4,
-) -> Dict[str, Dict[str, str]]:
+):
     """
     Speed fix for the translation step: every sync_*.py file used to split
     target_languages into batches of batch_size and translate them
@@ -375,15 +375,39 @@ def translate_in_batches(
     Wall-clock time for a full run becomes roughly
     (number of batches / max_workers) * (single batch's own latency),
     instead of (number of batches) * (single batch's own latency + 2s).
+
+    Returns (combined_translations, failed_languages):
+      - combined_translations: Dict[lang -> {field: translated_text}], same
+        as before.
+      - failed_languages: set of languages whose BATCH ITSELF failed (the
+        translate_fields() call raised after exhausting retries), and which
+        therefore got a verbatim copy of the English source instead of a
+        real translation.
+
+    CONFIRMED live bug this fixes: every calling sync_*.py file used to
+    decide "did this language actually translate?" by comparing the
+    translated text to the source text field-by-field — if identical,
+    it assumed the call had silently failed and dropped that language
+    entirely (never written, never marked done). That heuristic breaks for
+    short, commonly-borrowed words: a ticket modality literally named
+    "Standard" legitimately translates to "Standard" in French, German,
+    Polish, etc. (real value, not a fallback) — but the old "identical =
+    failed" check couldn't tell that apart from a genuine failure and
+    silently discarded it, every single run, forever. `failed_languages`
+    gives calling code a real signal to filter on instead: a language is
+    only unreliable if its batch actually raised, not merely because its
+    correct translation happens to match the English source.
     """
+    failed_languages = set()
     batches = [target_languages[i:i + batch_size] for i in range(0, len(target_languages), batch_size)]
     if len(batches) <= 1:
         # No concurrency needed/possible for a single batch.
         try:
-            return translator.translate_fields(fields, target_languages)
+            return translator.translate_fields(fields, target_languages), failed_languages
         except Exception as e:
             print(f"⚠️  Batch {target_languages} failed entirely: {e} — falling back to English for these languages.")
-            return {lang: dict(fields) for lang in target_languages}
+            failed_languages.update(target_languages)
+            return {lang: dict(fields) for lang in target_languages}, failed_languages
 
     combined: Dict[str, Dict[str, str]] = {}
     with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as executor:
@@ -400,7 +424,8 @@ def translate_in_batches(
                 print(f"⚠️  Batch {batch} failed entirely: {e} — falling back to English for these languages.")
                 for lang in batch:
                     combined[lang] = dict(fields)
-    return combined
+                    failed_languages.add(lang)
+    return combined, failed_languages
 
 
 def required_api_key_env_var() -> str:
