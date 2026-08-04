@@ -207,21 +207,23 @@ def sync_transfer_from_data(
 
     # Translate in batches, run concurrently instead of one-after-another
     translation_start = time.time()
-    combined_translations = translate_in_batches(translator, compressed_translatable, needed, batch_size=BATCH_SIZE)
+    combined_translations, failed_languages = translate_in_batches(translator, compressed_translatable, needed, batch_size=BATCH_SIZE)
     translation_time = time.time() - translation_start
 
-    # Filter out languages that didn't change
+    # NOTE: this used to filter out any language whose translated text was
+    # identical to the source, on the assumption that meant the call had
+    # silently failed. That's wrong for short/common words that legitimately
+    # translate to themselves (or a near-identical spelling) in several
+    # languages (e.g. a pickup point name) — it would silently and
+    # permanently drop a correct result. Now we only exclude languages
+    # translate_in_batches itself reports as having failed (see its
+    # docstring in translator.py); everything else is trusted as real.
     successful = {}
     for lang, trans in combined_translations.items():
-        changed = False
-        for field, src in translatable.items():
-            if trans.get(field) != src:
-                changed = True
-                break
-        if changed:
-            successful[lang] = trans
+        if lang in failed_languages:
+            print(f"⚠️  Translation batch for {lang} failed; skipping.")
         else:
-            print(f"⚠️  Translation for {lang} identical to source; skipping.")
+            successful[lang] = trans
 
     if not successful:
         return {"status": "skipped", "transfer_id": transfer_id, "reason": "no successful translations"}
