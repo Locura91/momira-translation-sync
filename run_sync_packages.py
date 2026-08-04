@@ -7,8 +7,10 @@ Momira Travel back office, or from a GET /package/{micrositeId} call):
     python run_sync_packages.py --package-id 59582825 --dry-run
 
 This fetches ONE real package, shows you exactly what it detected as
-translatable (title / largeTitle / description / themes) and what it would
-write for 2 test languages, and makes NO changes to Travel Compositor.
+translatable (title / largeTitle / description / ribbonText / remarks —
+themes are still intentionally left untouched, since they're internal
+category tags, not per-language text) and what it would write for 2 test
+languages, and makes NO changes to Travel Compositor.
 
 Then the full language list, still one package:
 
@@ -18,11 +20,16 @@ Then, only once that looks right, go live on that one package:
 
     python run_sync_packages.py --package-id 59582825 --all-languages
 
-Read the printed result carefully. If Travel Compositor rejects the PUT
-(look for "status": "failed" with an API error detail), that's the
-`visible`/`autocancelable`/`remarks` open item mentioned in
-sync_holiday_package.py — paste me the exact error text and we'll adjust
-the payload.
+Now that Travel Compositor has confirmed we're authorized to write Holiday
+Packages, this is the real first live test. Read the printed result
+carefully. If Travel Compositor still rejects the PUT (look for
+"status": "failed" with an API error detail on any language), paste me the
+exact error text and we'll adjust the payload from there.
+
+If you need to re-translate something already marked "done" (e.g. right
+after fixing a bug in the translator), add --force to bypass the tracker:
+
+    python run_sync_packages.py --package-id 59582825 --dry-run --force
 
 Finally, the whole microsite's package catalog:
 
@@ -68,8 +75,9 @@ def main():
     parser.add_argument("--microsite-id", default=os.getenv("TRAVELC_MICROSITE_ID", "momiratravel"),
                          help="Travel Compositor microsite id (default from .env)")
     parser.add_argument("--package-id", help="Sync a single holiday package by id (omit to sync ALL packages for the microsite)")
-    parser.add_argument("--all-languages", action="store_true", help="Use the full 35-language target list instead of the 2-language test set")
+    parser.add_argument("--all-languages", action="store_true", help="Use the full 30-language target list instead of the 2-language test set")
     parser.add_argument("--dry-run", action="store_true", help="Preview only — never calls PUT")
+    parser.add_argument("--force", action="store_true", help="Ignore the 'already translated' tracker and re-translate anyway")
     parser.add_argument("--limit", type=int, default=None, help="When syncing all packages, only process the first N (for testing)")
     args = parser.parse_args()
 
@@ -85,18 +93,24 @@ def main():
     print(f"🎯 Target languages this run: {target_languages}")
     if args.dry_run:
         print("🧪 DRY RUN MODE — no data will be written to Travel Compositor.\n")
+    if args.force:
+        print("🔁 FORCE MODE — ignoring the 'already translated' tracker for this run.\n")
 
     api = TravelCompositorAPI()
     translator = get_translator()
     store = StateStore()
 
     if args.package_id:
-        result = sync_holiday_package(api, translator, store, args.microsite_id, args.package_id, target_languages, dry_run=args.dry_run)
+        result = sync_holiday_package(
+            api, translator, store, args.microsite_id, args.package_id, target_languages,
+            dry_run=args.dry_run, force=args.force,
+        )
         print("\n=== RESULT ===")
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         results = sync_all_holiday_packages(
-            api, translator, store, args.microsite_id, target_languages, dry_run=args.dry_run, limit=args.limit
+            api, translator, store, args.microsite_id, target_languages,
+            dry_run=args.dry_run, limit=args.limit, force=args.force,
         )
         print("\n=== SUMMARY ===")
         by_status = {}
