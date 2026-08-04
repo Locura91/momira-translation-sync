@@ -10,7 +10,7 @@ from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from state_store import StateStore, compute_hash
-from translator import get_translator
+from translator import get_translator, translate_in_batches
 
 # ---- Configuration ----
 BATCH_SIZE = 10
@@ -310,15 +310,7 @@ def sync_hotel_main(api, translator, store: StateStore,
 
     # Translate
     compressed = compress_translatable_fields(translatable)
-    combined = {}
-    total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
-    for i in range(0, len(needed), BATCH_SIZE):
-        batch = needed[i:i+BATCH_SIZE]
-        print(f"   Hotel batch {i//BATCH_SIZE+1}/{total_batches}: {batch}")
-        batch_result = translator.translate_fields(compressed, batch)
-        combined.update(batch_result)
-        if i + BATCH_SIZE < len(needed):
-            time.sleep(DELAY_BETWEEN_BATCHES)
+    combined = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
 
     successful = {}
     for lang, trans in combined.items():
@@ -575,15 +567,7 @@ def sync_room(api, translator, store: StateStore,
 
     # Translate
     compressed = compress_translatable_fields(translatable)
-    combined = {}
-    total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
-    for i in range(0, len(needed), BATCH_SIZE):
-        batch = needed[i:i+BATCH_SIZE]
-        print(f"   Room {room_provider_code} batch {i//BATCH_SIZE+1}/{total_batches}: {batch}")
-        batch_result = translator.translate_fields(compressed, batch)
-        combined.update(batch_result)
-        if i + BATCH_SIZE < len(needed):
-            time.sleep(DELAY_BETWEEN_BATCHES)
+    combined = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
 
     successful = {}
     for lang, trans in combined.items():
@@ -682,15 +666,7 @@ def sync_supplement(api, translator, store: StateStore,
 
     # Translate
     compressed = compress_translatable_fields(translatable)
-    combined = {}
-    total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
-    for i in range(0, len(needed), BATCH_SIZE):
-        batch = needed[i:i+BATCH_SIZE]
-        print(f"   Supplement {supp_provider_code} batch {i//BATCH_SIZE+1}/{total_batches}: {batch}")
-        batch_result = translator.translate_fields(compressed, batch)
-        combined.update(batch_result)
-        if i + BATCH_SIZE < len(needed):
-            time.sleep(DELAY_BETWEEN_BATCHES)
+    combined = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
 
     successful = {}
     for lang, trans in combined.items():
@@ -789,15 +765,7 @@ def sync_offer(api, translator, store: StateStore,
 
     # Translate
     compressed = compress_translatable_fields(translatable)
-    combined = {}
-    total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
-    for i in range(0, len(needed), BATCH_SIZE):
-        batch = needed[i:i+BATCH_SIZE]
-        print(f"   Offer {offer_provider_code} batch {i//BATCH_SIZE+1}/{total_batches}: {batch}")
-        batch_result = translator.translate_fields(compressed, batch)
-        combined.update(batch_result)
-        if i + BATCH_SIZE < len(needed):
-            time.sleep(DELAY_BETWEEN_BATCHES)
+    combined = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
 
     successful = {}
     for lang, trans in combined.items():
