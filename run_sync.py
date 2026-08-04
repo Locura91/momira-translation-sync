@@ -1,38 +1,27 @@
 """
-run_sync_packages.py — command-line entrypoint for Holiday Package translation sync.
+run_sync.py — command-line entrypoint for the nbext translation-sync prototype.
 
-FIRST RUN — always start like this (pick a real holiday package id from your
-Momira Travel back office, or from a GET /package/{micrositeId} call):
+FIRST RUN — always start like this:
 
-    python run_sync_packages.py --package-id 59582825 --dry-run
+    python run_sync.py --supplier-id 12345 --transfer-id 67890 --dry-run
 
-This fetches ONE real package, shows you exactly what it detected as
-translatable (title / description / ribbonText — largeTitle and themes are
-intentionally left untouched) and what it would write for 2 test languages,
-and makes NO changes to Travel Compositor.
+This fetches ONE real transfer, shows you exactly what it detected as
+translatable text and what it would write for 2 test languages, and makes
+NO changes to Travel Compositor. Read the printed preview carefully before
+ever running without --dry-run.
 
-Then the full language list, still one package:
+Once that looks right, try the full target-language list on that one
+transfer:
 
-    python run_sync_packages.py --package-id 59582825 --dry-run --all-languages
+    python run_sync.py --supplier-id 12345 --transfer-id 67890 --dry-run --all-languages
 
-Then, only once that looks right, go live on that one package:
+Then, only once you trust the output, remove --dry-run to actually write:
 
-    python run_sync_packages.py --package-id 59582825 --all-languages
+    python run_sync.py --supplier-id 12345 --transfer-id 67890 --all-languages
 
-Read the printed result carefully. If Travel Compositor rejects the PUT
-(look for "status": "failed" with an API error detail), that's the
-`visible`/`autocancelable`/`remarks` open item mentioned in
-sync_holiday_package.py — paste me the exact error text and we'll adjust
-the payload.
+And finally, run it across every transfer for that supplier:
 
-If you need to re-translate something already marked "done" (e.g. right
-after fixing a bug in the translator), add --force to bypass the tracker:
-
-    python run_sync_packages.py --package-id 59582825 --dry-run --force
-
-Finally, the whole microsite's package catalog:
-
-    python run_sync_packages.py --all-languages
+    python run_sync.py --supplier-id 12345 --all-languages
 """
 
 import os
@@ -46,15 +35,19 @@ load_dotenv()
 from travelcompositor_api import TravelCompositorAPI
 from translator import get_translator, required_api_key_env_var
 from state_store import StateStore
-from sync_holiday_package import sync_holiday_package, sync_all_holiday_packages
+from sync_engine import sync_transfer, sync_all_transfers_for_supplier
 
-# Confirmed final list (30 targets, EN is always the source and never
-# appears here) — narrowed down from the earlier 35-language draft by
-# dropping PT_BR, ZH, FA, CA, EU, which are not needed after all.
+# Reduced from 30 to 19 target languages per your instruction: removed
+# Albanian (SQ), Arabic (AR), Azerbaijani (AZ), Georgian (KA), Japanese (JA),
+# Croatian (HR), Malay (MS), Serbian (SR), Thai (TH), Uzbek (UZ), and
+# Bulgarian (BG) — 11 languages dropped, same list shared across every
+# entity type. Persian/Farsi (Iran) was already absent from the 30-language
+# list before this change (dropped earlier in the original 35-language
+# draft, along with PT_BR/ZH/CA/EU), so it wasn't removed again here.
 DEFAULT_TARGET_LANGUAGES = [
-    "FR", "SL", "PL", "DE", "SK", "AR", "HR", "HU", "AZ", "NL", "ES", "TR",
-    "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS", "TH", "EL", "FI", "JA",
-    "SR", "PT", "DA", "IT", "MS", "SQ",
+    "FR", "SL", "PL", "DE", "SK", "HU", "NL", "ES", "TR",
+    "RU", "NO", "SV", "RO", "CS", "EL", "FI",
+    "PT", "DA", "IT",
 ]
 
 TEST_LANGUAGES = ["FR", "DE"]  # small, cheap sample for a first --dry-run
@@ -70,14 +63,12 @@ def get_target_languages(all_languages: bool) -> list:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="nbext translation-sync — Holiday Packages")
-    parser.add_argument("--microsite-id", default=os.getenv("TRAVELC_MICROSITE_ID", "momiratravel"),
-                         help="Travel Compositor microsite id (default from .env)")
-    parser.add_argument("--package-id", help="Sync a single holiday package by id (omit to sync ALL packages for the microsite)")
-    parser.add_argument("--all-languages", action="store_true", help="Use the full 30-language target list instead of the 2-language test set")
+    parser = argparse.ArgumentParser(description="nbext translation-sync prototype (Transfers only, v1)")
+    parser.add_argument("--supplier-id", required=True, help="Travel Compositor supplier ID")
+    parser.add_argument("--transfer-id", help="Sync a single transfer by ID (omit to sync ALL transfers for the supplier)")
+    parser.add_argument("--all-languages", action="store_true", help="Use the full target-language list instead of the 2-language test set")
     parser.add_argument("--dry-run", action="store_true", help="Preview only — never calls PUT")
-    parser.add_argument("--force", action="store_true", help="Ignore the 'already translated' tracker and re-translate anyway")
-    parser.add_argument("--limit", type=int, default=None, help="When syncing all packages, only process the first N (for testing)")
+    parser.add_argument("--limit", type=int, default=None, help="When syncing all transfers, only process the first N (for testing)")
     args = parser.parse_args()
 
     required_key = required_api_key_env_var()
@@ -92,24 +83,18 @@ def main():
     print(f"🎯 Target languages this run: {target_languages}")
     if args.dry_run:
         print("🧪 DRY RUN MODE — no data will be written to Travel Compositor.\n")
-    if args.force:
-        print("🔁 FORCE MODE — ignoring the 'already translated' tracker for this run.\n")
 
     api = TravelCompositorAPI()
     translator = get_translator()
     store = StateStore()
 
-    if args.package_id:
-        result = sync_holiday_package(
-            api, translator, store, args.microsite_id, args.package_id, target_languages,
-            dry_run=args.dry_run, force=args.force,
-        )
+    if args.transfer_id:
+        result = sync_transfer(api, translator, store, args.supplier_id, args.transfer_id, target_languages, dry_run=args.dry_run)
         print("\n=== RESULT ===")
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
-        results = sync_all_holiday_packages(
-            api, translator, store, args.microsite_id, target_languages,
-            dry_run=args.dry_run, limit=args.limit, force=args.force,
+        results = sync_all_transfers_for_supplier(
+            api, translator, store, args.supplier_id, target_languages, dry_run=args.dry_run, limit=args.limit
         )
         print("\n=== SUMMARY ===")
         by_status = {}
