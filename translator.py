@@ -32,6 +32,7 @@ import os
 import json
 import time
 from typing import Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
@@ -322,6 +323,63 @@ class FallbackTranslator:
         except (ProviderRateLimitError, Exception) as e:
             print(f"⚠️  Primary provider failed: {e}. Switching to Claude for this batch...")
             return self.fallback.translate_fields(source_fields, target_languages, retries)
+
+
+def translate_in_batches(
+    translator,
+    fields: Dict[str, str],
+    target_languages: List[str],
+    batch_size: int = 10,
+    max_workers: int = 4,
+) -> Dict[str, Dict[str, str]]:
+    """
+    Speed fix for the translation step: every sync_*.py file used to split
+    target_languages into batches of batch_size and translate them
+    SEQUENTIALLY, sleeping 2 seconds between each batch for no functional
+    reason (an artifact from early rate-limit caution). For a full
+    30-language run at batch_size=10, that was 3 sequential API calls plus
+    ~4s of pure dead-time sleep; at batch_size=5 (Holiday Packages), 6
+    sequential calls plus ~10s of dead-time. Worse, a single batch raising
+    an exception had no per-batch handling, so it could abort the ENTIRE
+    sync for that item.
+
+    This runs the batches CONCURRENTLY instead (bounded by max_workers, so
+    we don't blast the provider with unlimited parallel requests), and
+    isolates failures per-batch: if one batch's translate_fields() call
+    raises, only that batch's languages fall back to English — every other
+    concurrent batch still completes normally. Each provider's own
+    retry/backoff/rate-limit handling (in GeminiTranslator/ClaudeTranslator/
+    FallbackTranslator) is unchanged and still applies within each batch.
+
+    Wall-clock time for a full run becomes roughly
+    (number of batches / max_workers) * (single batch's own latency),
+    instead of (number of batches) * (single batch's own latency + 2s).
+    """
+    batches = [target_languages[i:i + batch_size] for i in range(0, len(target_languages), batch_size)]
+    if len(batches) <= 1:
+        # No concurrency needed/possible for a single batch.
+        try:
+            return translator.translate_fields(fields, target_languages)
+        except Exception as e:
+            print(f"⚠️  Batch {target_languages} failed entirely: {e} — falling back to English for these languages.")
+            return {lang: dict(fields) for lang in target_languages}
+
+    combined: Dict[str, Dict[str, str]] = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as executor:
+        future_to_batch = {
+            executor.submit(translator.translate_fields, fields, batch): batch
+            for batch in batches
+        }
+        for future in as_completed(future_to_batch):
+            batch = future_to_batch[future]
+            try:
+                result = future.result()
+                combined.update(result)
+            except Exception as e:
+                print(f"⚠️  Batch {batch} failed entirely: {e} — falling back to English for these languages.")
+                for lang in batch:
+                    combined[lang] = dict(fields)
+    return combined
 
 
 def required_api_key_env_var() -> str:
