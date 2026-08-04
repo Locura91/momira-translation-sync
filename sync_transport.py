@@ -255,20 +255,22 @@ def sync_transport_from_data(
     compressed_translatable = compress_translatable_fields(translatable)
 
     translation_start = time.time()
-    combined_translations = translate_in_batches(translator, compressed_translatable, needed, batch_size=BATCH_SIZE)
+    combined_translations, failed_languages = translate_in_batches(translator, compressed_translatable, needed, batch_size=BATCH_SIZE)
     translation_time = time.time() - translation_start
 
+    # NOTE: this used to filter out any language whose translated text was
+    # identical to the source, on the assumption that meant the call had
+    # silently failed. That's wrong for short/common words that legitimately
+    # translate to themselves in several languages — it would silently and
+    # permanently drop a correct result. Now we only exclude languages
+    # translate_in_batches itself reports as having failed (see its
+    # docstring in translator.py); everything else is trusted as real.
     successful = {}
     for lang, trans in combined_translations.items():
-        changed = False
-        for field, src in translatable.items():
-            if trans.get(field) != src:
-                changed = True
-                break
-        if changed:
-            successful[lang] = trans
+        if lang in failed_languages:
+            print(f"⚠️  Translation batch for {lang} failed; skipping.")
         else:
-            print(f"⚠️  Translation for {lang} identical to source; skipping.")
+            successful[lang] = trans
 
     if not successful:
         return {"status": "skipped", "transport_id": transport_id, "reason": "no successful translations"}
@@ -433,19 +435,18 @@ def sync_transport_option_from_data(
         return {"status": "up_to_date", "option_code": option_code}
 
     compressed_translatable = compress_translatable_fields(translatable)
-    combined_translations = translate_in_batches(translator, compressed_translatable, needed, batch_size=BATCH_SIZE)
+    combined_translations, failed_languages = translate_in_batches(translator, compressed_translatable, needed, batch_size=BATCH_SIZE)
 
+    # See the comment on the main-entity translate call above: an option's
+    # translated text can legitimately be identical to the source for
+    # short/common words — only drop languages translate_in_batches itself
+    # reports as having failed.
     successful = {}
     for lang, trans in combined_translations.items():
-        changed = False
-        for field, src in translatable.items():
-            if trans.get(field) != src:
-                changed = True
-                break
-        if changed:
-            successful[lang] = trans
+        if lang in failed_languages:
+            print(f"⚠️  Translation batch for {lang} failed; skipping.")
         else:
-            print(f"⚠️  Translation for {lang} identical to source; skipping.")
+            successful[lang] = trans
 
     if not successful:
         return {"status": "skipped", "option_code": option_code, "reason": "no successful translations"}
