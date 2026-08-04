@@ -74,10 +74,19 @@ from sync_hotel import (
 # sync_closed_tour.py's module docstring)
 from sync_closed_tour import sync_closed_tour
 
+# Reduced from 30 to 19 target languages per your instruction: removed
+# Albanian (SQ), Arabic (AR), Azerbaijani (AZ), Georgian (KA), Japanese (JA),
+# Croatian (HR), Malay (MS), Serbian (SR), Thai (TH), Uzbek (UZ), and
+# Bulgarian (BG) — 11 languages dropped, applying to every entity type
+# (Holiday Packages, Tickets, Transfers, Transports, Hotels, Closed Tours)
+# since they all share this single list. Persian/Farsi (Iran) was already
+# absent from the 30-language list before this change (dropped earlier,
+# see run_sync.py's docstring), so it wasn't removed again here — that's
+# why 30 minus your 12-item list still lands on 19, not 18.
 DEFAULT_TARGET_LANGUAGES = [
-    "FR", "SL", "PL", "DE", "SK", "AR", "HR", "HU", "AZ", "NL", "ES", "TR",
-    "KA", "UZ", "RU", "NO", "SV", "RO", "BG", "CS", "TH", "EL", "FI", "JA",
-    "SR", "PT", "DA", "IT", "MS", "SQ",
+    "FR", "SL", "PL", "DE", "SK", "HU", "NL", "ES", "TR",
+    "RU", "NO", "SV", "RO", "CS", "EL", "FI",
+    "PT", "DA", "IT",
 ]
 TEST_LANGUAGES = ["FR", "DE"]
 
