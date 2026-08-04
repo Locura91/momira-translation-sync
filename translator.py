@@ -72,7 +72,16 @@ Rules you must always follow:
 - Domain preservation: keep travel-industry terms idiomatic in the target language
   ("airport transfer", "half-board", "meeting point", "pickup location") rather than
   literal word-for-word substitutes. Never translate product codes, IDs, or supplier
-  identifiers that appear inside the text.
+  identifiers that appear inside the text — meaning literal internal reference codes
+  such as "TNR-03", "DPS-1", or "Code1", NOT tour/package titles. A field named
+  "title" or "largeTitle" (e.g. "8 Days Bali Complete", "Getting to Know Madagascar's
+  People and Lemurs - 14 Days") is real customer-facing marketing copy and MUST be
+  translated in full — translate every translatable word (numbers-as-words like
+  "Days"/"Tage"/"Jours", connecting words, adjectives like "Complete"/"Classic"/
+  "Highlights") while only leaving genuine proper nouns (destination/place names,
+  brand names like "Mövenpick") unchanged. Do not skip or leave a title untranslated
+  just because it is short or contains place names — a title consisting only of a
+  place name plus ordinary descriptive words is not a product code.
 - Formatting integrity: preserve HTML tags (<b>, <br>, etc.), Markdown, and template
   variables (e.g. {duration}, {pickupTime}) EXACTLY as they appear, untouched, in the
   same position.
