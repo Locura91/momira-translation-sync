@@ -10,7 +10,23 @@ from state_store import StateStore, compute_hash
 from translator import translate_in_batches
 
 ENTITY_TYPE = "holiday_package"
-TEXT_FIELDS = ("title", "description", "ribbonText")
+# "remarks" added per your instruction: cancellation/voucher-remarks-style
+# text must be translated for all services, not just carried through
+# untouched. This was previously in WRITABLE_FIELDS only (passed through
+# as-is on every PUT) but never actually translated — that's the "open
+# item" the old docstrings referred to. Now that Travel Compositor has
+# confirmed we're authorized to write Holiday Packages, this is the first
+# real chance to test it live.
+#
+# "largeTitle" added after a live test on package 60128411 ("11 Days
+# Jewels of Thailand"): confirmed via a real GET /package/{micrositeId}
+# dump that "title" and "largeTitle" carry IDENTICAL text on every single
+# package in the catalog (98/98 checked). Previously only "title" was
+# translated and largeTitle was passed through untouched by design — but
+# since they're the same customer-facing text, largeTitle needs the same
+# translation. Both are extracted/translated independently (not copied
+# from one to the other) in case they ever diverge on some package.
+TEXT_FIELDS = ("title", "largeTitle", "description", "ribbonText", "remarks")
 WRITABLE_FIELDS = (
     "active", "title", "largeTitle", "description", "remarks",
     "visible", "order", "autocancelable",
