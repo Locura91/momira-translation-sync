@@ -1,5 +1,31 @@
 """
 translator.py — AI translation engine with fallback (Gemini first, then Claude).
+
+CONFIRMED BUG FIX (verified directly against the installed google-genai SDK,
+same way the earlier response_format bug was caught): the GeminiTranslator
+config previously included a top-level "timeout": 60 key. That is NOT a
+valid field on google.genai.types.GenerateContentConfig — instantiating it
+raises pydantic.ValidationError: "Extra inputs are not permitted
+[type=extra_forbidden]". This meant EVERY Gemini call was failing
+immediately, on every entity type (Holiday Packages, Tickets, Transfers,
+Transports, Hotels). Under TRANSLATION_PROVIDER=fallback, this silently
+fell back to Claude every time (i.e. paying full Claude Haiku prices, not
+the cheaper Gemini price this switch was meant to get, plus ~31s of wasted
+retry/backoff sleep per batch). Under TRANSLATION_PROVIDER=gemini (no
+fallback), every sync call would hard-fail.
+
+Fix: a client-side request timeout, if wanted, goes under
+"http_options": {"timeout": <milliseconds>} — NOT a bare "timeout" key.
+We're not setting one at all here (removing it entirely) since the
+retries/backoff loop already handles slow/hanging calls, and an
+overly-aggressive client timeout on a legitimately-slow big-batch call
+would just trigger more retries.
+
+Also restored max_output_tokens to 32768 (was reduced to 8192) — Tickets
+have more fields per language (name, description, meetingPoint,
+activityType, voucherRemarks, departureTime, includes, excludes) than
+Holiday Packages (title, description, ribbonText), so a 10-language batch
+risked truncating mid-JSON at 8192.
 """
 
 import os
@@ -204,9 +230,28 @@ class GeminiTranslator:
                         "system_instruction": SYSTEM_PROMPT,
                         "response_mime_type": "application/json",
                         "response_json_schema": schema,
+                        # 0 = disabled. Flash's "thinking" mode adds real
+                        # latency for a task this simple — we don't need
+                        # reasoning for translation, just fast structured
+                        # output.
                         "thinking_config": {"thinking_budget": 0},
-                        "max_output_tokens": 8192,
-                        "timeout": 60,
+                        # Generous cap so a big multi-field batch (e.g.
+                        # Tickets: name/description/meetingPoint/
+                        # activityType/voucherRemarks/departureTime/
+                        # includes/excludes across up to 10 languages at
+                        # once) can't get silently truncated mid-JSON.
+                        "max_output_tokens": 32768,
+                        # NOTE: a client-side request timeout, if wanted,
+                        # goes under http_options (milliseconds) — NOT a
+                        # bare "timeout" key. A bare "timeout" key is not a
+                        # valid GenerateContentConfig field and raises a
+                        # pydantic ValidationError on every single call
+                        # (confirmed against the installed SDK) — this was
+                        # silently breaking every Gemini call and forcing a
+                        # fallback to Claude (or a hard failure with no
+                        # fallback configured). Deliberately omitted here;
+                        # add "http_options": {"timeout": 60000} if a
+                        # client-side timeout is genuinely needed.
                     },
                 )
                 parsed = json.loads(response.text)
