@@ -73,7 +73,45 @@ def extract_translatable_fields_from_transport(transport_entry: Dict[str, Any]) 
 
 
 def get_existing_content_for_language(entry: Dict[str, Any], lang: str) -> Dict[str, str]:
-    # Try datasheets, then translations, then remarks
+    """
+    Look for genuinely per-language existing content for `lang`, checking
+    (in order) datasheets, translations, and remarks — the ONLY places
+    per-language name/description ever actually get WRITTEN for a transport
+    (see build_updated_datasheets / sync_transport_from_data: every write
+    nests translated content inside one of these three, never at the
+    entry's top level).
+
+    IMPORTANT — this used to also fall back to the transport's top-level
+    "name"/"description" fields when no per-language entry was found for
+    `lang`. That fallback is what caused a real, confirmed live bug: a
+    genuine transport (TRANSPORT-408971, "One-way transfer Praslin - La
+    Digue") has a top-level "name" field (a static reference copy of the EN
+    name — never itself translated) but NO top-level "description" field at
+    all; "description" only ever exists inside datasheets.EN. When the
+    self-healing/verify check compared that partial fallback
+    ({"name": EN_name} only — "description" simply missing/None) against
+    the real source fields ({"name": EN_name, "description": EN_desc}), the
+    missing "description" key made the comparison register as "differs from
+    source" — which the surrounding logic (wrongly) reads as "already
+    translated". Result: on the very FIRST sync of this transport, before
+    the translator was ever called, the state store got marked "done" for
+    every target language and the live run reported "up_to_date" — name and
+    description were never translated at all, silently, forever (every
+    later run kept trusting that same stale state).
+
+    Fix: removed the top-level fallback entirely. The only real source of
+    per-language transport content is datasheets[lang] (or translations/
+    remarks, if a transport ever uses those instead) — if none of those has
+    `lang` yet, the correct signal is simply "not translated yet" (empty
+    dict), not a guess pieced together from unrelated top-level fields that
+    are never actually written to.
+
+    If you're re-running a transport that already got stuck reporting
+    "up_to_date" without ever writing a translation (from before this fix),
+    the stale "done" state for it needs to be overridden once with --force
+    so it actually retranslates and records the real result; after that,
+    normal runs behave correctly on their own.
+    """
     for key in ("datasheets", "translations", "remarks"):
         container = entry.get(key)
         if container and isinstance(container, dict):
@@ -87,13 +125,7 @@ def get_existing_content_for_language(entry: Dict[str, Any], lang: str) -> Dict[
                     return fields
             elif isinstance(lang_entry, str) and lang_entry.strip():
                 return {"remarks": lang_entry}
-    # Also check top-level fields like name, description
-    fields = {}
-    for f in ("name", "description"):
-        val = entry.get(f)
-        if isinstance(val, str) and val.strip():
-            fields[f] = val
-    return fields
+    return {}
 
 
 def build_updated_datasheets(
