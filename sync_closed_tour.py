@@ -87,10 +87,26 @@ OPTION_ENTITY_TYPE = "closed_tour_option"
 # The first live test on the Madagascar tour (a 14-day, several-thousand-
 # word description) burned real time/cost on repeated truncated-response
 # retries with the OLD (too-small) Claude max_tokens=8192 default — now
-# fixed, but keeping this batch size small is still cheap, real insurance:
-# batches run CONCURRENTLY (see translate_in_batches in translator.py), so
-# more/smaller batches cost nothing in wall-clock time.
-DATASHEET_BATCH_SIZE = 2
+# fixed.
+#
+# CONFIRMED via real Streamlit Cloud logs (BKK-3, supplier 49844, full
+# 30-language run): with batch size 2 AND HTML formatting no longer
+# stripped before translation (see strip_html_and_compress's docstring),
+# Claude was hitting the 120s request timeout — "Request timed out or
+# interrupted" — on multiple batches, 6 attempts each, before giving up
+# and falling back to English for those languages. This isn't a transient
+# network blip: sending 2 languages' worth of full un-stripped HTML
+# across up to 9 fields (name/description/included/excluded/hotels/
+# voucherRemarks/meetingPoint/remarksTitle/remarksDescription) in one
+# call is apparently too much for Claude to generate inside the timeout,
+# consistently — retrying the identical request 6 times just wastes
+# minutes repeating the same failure. Reduced to 1 language per batch to
+# roughly halve what has to be generated per call. Batches still run
+# CONCURRENTLY (see translate_in_batches in translator.py), so more/
+# smaller batches cost nothing in wall-clock time — if anything this
+# should be faster overall now that batches actually complete instead of
+# timing out and retrying.
+DATASHEET_BATCH_SIZE = 1
 OPTION_BATCH_SIZE = 10
 MAX_OPTION_WORKERS = 5  # parallel option fetches, same pattern as Tickets/Transports
 
@@ -291,18 +307,21 @@ def sync_closed_tour_from_data(
 
     compressed_translatable = compress_translatable_fields(translatable)
     translation_start = time.time()
-    combined_translations = translate_in_batches(
+    combined_translations, failed_languages = translate_in_batches(
         translator, compressed_translatable, needed, batch_size=DATASHEET_BATCH_SIZE
     )
     translation_time = time.time() - translation_start
 
+    # NOTE: no longer treats "translation identical to source" as a failure
+    # signal — short/common words can legitimately translate to themselves
+    # in several languages. Only languages translate_in_batches itself
+    # reports as failed (see its docstring in translator.py) get dropped.
     successful = {}
     for lang, trans in combined_translations.items():
-        changed = any(trans.get(f) != src for f, src in translatable.items())
-        if changed:
-            successful[lang] = trans
+        if lang in failed_languages:
+            print(f"⚠️  Translation batch for {lang} failed; skipping.")
         else:
-            print(f"⚠️  Translation for {lang} identical to source; skipping.")
+            successful[lang] = trans
 
     if not successful:
         return {"status": "skipped", "closed_tour_code": closed_tour_code, "reason": "no successful translations"}
@@ -417,17 +436,19 @@ def sync_closed_tour_option_from_data(
         return {"status": "up_to_date", "option_code": option_code}
 
     compressed_translatable = compress_translatable_fields(translatable)
-    combined_translations = translate_in_batches(
+    combined_translations, failed_languages = translate_in_batches(
         translator, compressed_translatable, needed, batch_size=OPTION_BATCH_SIZE
     )
 
+    # See the main-entity translate call above: identical-to-source is not a
+    # failure signal on its own — only translate_in_batches-reported
+    # failures get dropped.
     successful = {}
     for lang, trans in combined_translations.items():
-        changed = any(trans.get(f) != src for f, src in translatable.items())
-        if changed:
-            successful[lang] = trans
+        if lang in failed_languages:
+            print(f"⚠️  Translation batch for {lang} failed; skipping.")
         else:
-            print(f"⚠️  Translation for {lang} identical to source; skipping.")
+            successful[lang] = trans
 
     if not successful:
         return {"status": "skipped", "option_code": option_code, "reason": "no successful translations"}
