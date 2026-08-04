@@ -9,7 +9,7 @@ from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from state_store import StateStore, compute_hash
-from translator import get_translator
+from translator import get_translator, translate_in_batches
 
 # ---- Configuration ----
 BATCH_SIZE = 10
@@ -192,17 +192,10 @@ def sync_ticket_from_data(
 
     compressed_translatable = compress_translatable_fields(translatable)
 
-    combined_translations = {}
     total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
+    print(f"   translating {len(needed)} language(s) in {total_batches} batch(es), running concurrently")
     translation_start = time.time()
-    for i in range(0, len(needed), BATCH_SIZE):
-        batch = needed[i:i+BATCH_SIZE]
-        batch_num = i//BATCH_SIZE + 1
-        print(f"   batch {batch_num}/{total_batches}: {batch}")
-        batch_result = translator.translate_fields(compressed_translatable, batch)
-        combined_translations.update(batch_result)
-        if i + BATCH_SIZE < len(needed):
-            time.sleep(DELAY_BETWEEN_BATCHES)
+    combined_translations = translate_in_batches(translator, compressed_translatable, needed, batch_size=BATCH_SIZE)
     translation_time = time.time() - translation_start
 
     successful = {}
@@ -364,17 +357,7 @@ def sync_ticket_option_from_data(
         return {"status": "up_to_date", "option_code": option_code}
 
     compressed_translatable = compress_translatable_fields(translatable)
-
-    combined_translations = {}
-    total_batches = (len(needed) + BATCH_SIZE - 1) // BATCH_SIZE
-    for i in range(0, len(needed), BATCH_SIZE):
-        batch = needed[i:i+BATCH_SIZE]
-        batch_num = i//BATCH_SIZE + 1
-        print(f"   batch {batch_num}/{total_batches}: {batch}")
-        batch_result = translator.translate_fields(compressed_translatable, batch)
-        combined_translations.update(batch_result)
-        if i + BATCH_SIZE < len(needed):
-            time.sleep(DELAY_BETWEEN_BATCHES)
+    combined_translations = translate_in_batches(translator, compressed_translatable, needed, batch_size=BATCH_SIZE)
 
     successful = {}
     for lang, trans in combined_translations.items():
