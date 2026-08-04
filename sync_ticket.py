@@ -12,7 +12,22 @@ from state_store import StateStore, compute_hash
 from translator import get_translator, translate_in_batches
 
 # ---- Configuration ----
-BATCH_SIZE = 10
+# CONFIRMED via a real live run (ticket USM-T3, full 30-language target list):
+# with BATCH_SIZE=10 and 8 translatable fields per language (name, description,
+# meetingPoint, activityType, voucherRemarks, departureTime, includes, excludes
+# — and HTML no longer stripped before translation, see strip_html_and_compress's
+# docstring), 30 languages / 10 per batch = 3 batches. Only the LAST batch (the
+# 10 languages TH/EL/FI/JA/SR/PT/DA/IT/MS/SQ) came back in "languages_written" —
+# the first two batches (FR..NL and ES..CS, 20 languages total) silently
+# produced nothing: Claude was hitting its request timeout generating that much
+# content per call, exactly like the earlier confirmed Closed Tour timeout bug,
+# and those failed batches just got dropped instead of erroring loudly. Reduced
+# to 1 language per batch so each call has to generate far less content and
+# reliably finishes inside the timeout. Batches still run CONCURRENTLY (see
+# translate_in_batches in translator.py, default max_workers=4), so this costs
+# more API calls (fine — correctness matters more than a few extra cents here)
+# but not proportionally more wall-clock time.
+BATCH_SIZE = 1
 DELAY_BETWEEN_BATCHES = 2
 MAX_OPTION_WORKERS = 5   # number of parallel option fetches
 
