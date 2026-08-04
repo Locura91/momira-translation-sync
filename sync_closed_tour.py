@@ -231,13 +231,26 @@ def sync_closed_tour_from_data(
     supplier_id: str,
     closed_tour_entry: Dict[str, Any],
     target_languages: List[str],
+    closed_tour_code: str,
     dry_run: bool = True,
     force: bool = False,
 ) -> Dict[str, Any]:
+    """
+    IMPORTANT: `closed_tour_code` must be the code the caller used to fetch
+    this entry via api.get_closed_tour(supplier_id, closed_tour_code) — NOT
+    re-derived from closed_tour_entry.get("code"). Confirmed via a real
+    live test (supplier 50951, queried code "ASW-3"): the entry's own
+    "code" field came back as "CLOSEDTOUR-414490", a DIFFERENT value than
+    the code used to look it up. The option endpoints
+    (GET/PUT /closedtour/{supplierId}/{closedTourCode}/{optionCode}) need
+    the code that Travel Compositor actually recognizes in that URL
+    position, which is the queried code — using entry.get("code") there
+    caused every option fetch to 404 with "Closed tour not found" (the
+    closedTourCode segment itself was being rejected, not the option).
+    """
     start_time = time.time()
-    closed_tour_code = closed_tour_entry.get("code")
     if not closed_tour_code:
-        return {"status": "skipped", "reason": "no 'code' field on closed tour entry"}
+        return {"status": "skipped", "reason": "no closed_tour_code provided"}
 
     # Same rule as every other entity type in this project: only active
     # tours get translated. If Closed Tours should NOT follow this rule,
@@ -441,14 +454,21 @@ def sync_all_options_for_closed_tour_from_data(
     supplier_id: str,
     closed_tour_entry: Dict[str, Any],
     target_languages: List[str],
+    closed_tour_code: str,
     dry_run: bool = True,
     force: bool = False,
 ) -> List[Dict[str, Any]]:
+    """
+    IMPORTANT: `closed_tour_code` must be the code originally used to fetch
+    this entry (api.get_closed_tour(supplier_id, closed_tour_code)) — NOT
+    closed_tour_entry.get("code"). See the docstring on
+    sync_closed_tour_from_data for why: those two values can genuinely
+    differ, and the option endpoints need the queried one.
+    """
     modality_codes = closed_tour_entry.get("modalityCodes", [])
     if not modality_codes:
-        return [{"status": "skipped", "closed_tour_code": closed_tour_entry.get("code"), "reason": "no options"}]
+        return [{"status": "skipped", "closed_tour_code": closed_tour_code, "reason": "no options"}]
 
-    closed_tour_code = closed_tour_entry.get("code")
     option_entries = {}
     with ThreadPoolExecutor(max_workers=MAX_OPTION_WORKERS) as executor:
         future_to_code = {
@@ -521,12 +541,12 @@ def sync_closed_tour(
 
     main_result = sync_closed_tour_from_data(
         api, translator, store, supplier_id, entry, target_languages,
-        dry_run=dry_run, force=force
+        closed_tour_code, dry_run=dry_run, force=force
     )
 
     option_results = sync_all_options_for_closed_tour_from_data(
         api, translator, store, supplier_id, entry, target_languages,
-        dry_run=dry_run, force=force
+        closed_tour_code, dry_run=dry_run, force=force
     ) if isinstance(main_result, dict) and main_result.get("status") not in ("fetch_failed",) else []
 
     if isinstance(main_result, dict):
