@@ -319,19 +319,18 @@ def sync_hotel_main(api, translator, store: StateStore,
 
     # Translate
     compressed = compress_translatable_fields(translatable)
-    combined = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
+    combined, failed_languages = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
 
+    # NOTE: no longer treats "translation identical to source" as a failure
+    # signal — a hotel name/description can legitimately be the same word
+    # in several languages (brand names, short common words). Only
+    # languages translate_in_batches itself reports as failed get dropped.
     successful = {}
     for lang, trans in combined.items():
-        changed = False
-        for field, src in translatable.items():
-            if trans.get(field) != src:
-                changed = True
-                break
-        if changed:
-            successful[lang] = trans
+        if lang in failed_languages:
+            print(f"⚠️  Hotel translation batch for {lang} failed; skipping.")
         else:
-            print(f"⚠️  Hotel translation for {lang} identical; skipping.")
+            successful[lang] = trans
 
     if not successful:
         return {"status": "skipped", "contract_id": contract_id, "reason": "no successful translations"}
@@ -576,19 +575,17 @@ def sync_room(api, translator, store: StateStore,
 
     # Translate
     compressed = compress_translatable_fields(translatable)
-    combined = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
+    combined, failed_languages = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
 
+    # See the main-hotel translate call above: identical-to-source is not a
+    # failure signal on its own — only translate_in_batches-reported
+    # failures get dropped.
     successful = {}
     for lang, trans in combined.items():
-        changed = False
-        for field, src in translatable.items():
-            if trans.get(field) != src:
-                changed = True
-                break
-        if changed:
-            successful[lang] = trans
+        if lang in failed_languages:
+            print(f"⚠️  Room translation batch for {lang} failed; skipping.")
         else:
-            print(f"⚠️  Room translation for {lang} identical; skipping.")
+            successful[lang] = trans
 
     if not successful:
         return {"status": "skipped", "room_code": room_provider_code, "reason": "no successful translations"}
@@ -675,19 +672,17 @@ def sync_supplement(api, translator, store: StateStore,
 
     # Translate
     compressed = compress_translatable_fields(translatable)
-    combined = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
+    combined, failed_languages = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
 
+    # See the main-hotel translate call above: identical-to-source is not a
+    # failure signal on its own — only translate_in_batches-reported
+    # failures get dropped.
     successful = {}
     for lang, trans in combined.items():
-        changed = False
-        for field, src in translatable.items():
-            if trans.get(field) != src:
-                changed = True
-                break
-        if changed:
-            successful[lang] = trans
+        if lang in failed_languages:
+            print(f"⚠️  Supplement translation batch for {lang} failed; skipping.")
         else:
-            print(f"⚠️  Supplement translation for {lang} identical; skipping.")
+            successful[lang] = trans
 
     if not successful:
         return {"status": "skipped", "supplement_code": supp_provider_code, "reason": "no successful translations"}
@@ -774,19 +769,17 @@ def sync_offer(api, translator, store: StateStore,
 
     # Translate
     compressed = compress_translatable_fields(translatable)
-    combined = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
+    combined, failed_languages = translate_in_batches(translator, compressed, needed, batch_size=BATCH_SIZE)
 
+    # See the main-hotel translate call above: identical-to-source is not a
+    # failure signal on its own — only translate_in_batches-reported
+    # failures get dropped.
     successful = {}
     for lang, trans in combined.items():
-        changed = False
-        for field, src in translatable.items():
-            if trans.get(field) != src:
-                changed = True
-                break
-        if changed:
-            successful[lang] = trans
+        if lang in failed_languages:
+            print(f"⚠️  Offer translation batch for {lang} failed; skipping.")
         else:
-            print(f"⚠️  Offer translation for {lang} identical; skipping.")
+            successful[lang] = trans
 
     if not successful:
         return {"status": "skipped", "offer_code": offer_provider_code, "reason": "no successful translations"}
