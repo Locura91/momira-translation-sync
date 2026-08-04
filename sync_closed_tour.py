@@ -105,11 +105,19 @@ OPTION_TEXT_FIELDS = ("name", "remarks")
 
 
 def strip_html_and_compress(text: str) -> str:
-    if not text:
-        return text
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+    """
+    NO-OP passthrough now. This used to strip every HTML tag out of a
+    field before sending it to the translator — which is exactly why the
+    live ASW-3 test came back with description/included/excluded/hotels
+    flattened to plain <p> text instead of keeping the source's <ul><li>,
+    <b>, etc. structure. translator.py's SYSTEM_PROMPT already explicitly
+    instructs the model to "preserve HTML tags ... EXACTLY as they
+    appear, untouched, in the same position" — but that instruction was
+    meaningless here because the tags were being stripped out before the
+    model ever saw them. Fix: stop stripping; let the model see (and
+    preserve) the real HTML.
+    """
+    return text
 
 
 def compress_translatable_fields(fields: Dict[str, str]) -> Dict[str, str]:
